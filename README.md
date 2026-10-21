@@ -30,6 +30,12 @@ Semua decoding, analisis AI, dan encoding terjadi di device lo sendiri.
 | 10 | **Scene detect** | Analisis piksel + histogram, ambang adaptif **median+MAD** — potong pas di pergantian adegan, bukan durasi patokan |
 | 11 | **AI Momen Viral + AUTO DURASI** | Mencari **di bagian mana** video punya **HOOK · PACING · KONTEKS** — skor 0–100 per segmen dari transkrip Whisper + energi audio + adegan; mode **⚡ AUTO AI** menentukan sendiri durasi tiap klip (10 dtk–3 mnt) sesuai selesainya topik; langsung PUTAR / POTONG / EKSPOR / GABUNG semua momen |
 
+## 🛠️ Catatan versi & pemecahan masalah
+
+- **v1.2.1 — FIX LAYAR HITAM**: aplikasi Windows versi lama bisa tampil layar hitam saat dibuka (path asset absolut `/\_next/…` rusak di protokol `file://`). Sekarang dimuat via protokol kustom `app://` + path asset relatif — sudah diuji headless (JS terhidrasi + CSS termuat). **Wajib update ke 1.2.1.**
+- Installer **unsigned** → SmartScreen warning: klik **More info → Run anyway**.
+- Kalau unduhan model AI pertama terputus: jalankan app sekali lagi, unduhan lanjut dari cache.
+
 ## 🔒 Kenapa offline?
 
 | Kebutuhan | Online? |

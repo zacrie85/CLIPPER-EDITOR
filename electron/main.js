@@ -1,11 +1,33 @@
 /* ============================================================
    CLIPPER EDITOR — Electron main process
    Mode dev : load http://localhost:3000
-   Mode prod: load build statik dari ../out (next build + export)
+   Mode prod: load build statik dari ../out via protokol app://
+
+   ⚠️ PENTING: build statik Next.js memakai path absolut (/\_next/…).
+   Kalau dimuat via loadFile (file://), path itu resolve ke root drive
+   (file:///C:/\_next/…) → CSS & JS gagal → LAYAR HITAM.
+   Solusi: protokol kustom app:// yang memetakan /\_next/… ke folder out/.
    ============================================================ */
 
-const { app, BrowserWindow, shell, Menu } = require("electron");
+const { app, BrowserWindow, shell, Menu, protocol, net } = require("electron");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
+
+const OUT_DIR = path.join(__dirname, "..", "out");
+
+// protokol kustom — WAJIB didaftarkan sebelum app ready
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "app",
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      stream: true, // wajib utk WebAssembly.instantiateStreaming (Whisper)
+      codeCache: true,
+    },
+  },
+]);
 
 const isDev = !app.isPackaged;
 let win = null;
@@ -47,7 +69,7 @@ function createWindow() {
   if (isDev) {
     win.loadURL("http://localhost:3000");
   } else {
-    win.loadFile(path.join(__dirname, "../out/index.html"));
+    win.loadURL("app://./index.html");
     // server statik tidak ada — fetch model AI tetap lewat internet saat pertama
   }
 
@@ -55,6 +77,23 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  // handler app:// — layani file dari out/; path absolut /\_next/… resolve
+  // ke app://./\_next/… karena scheme diberi privileges "standard"
+  protocol.handle("app", (request) => {
+    try {
+      let p = decodeURIComponent(new URL(request.url).pathname);
+      if (p === "/" || p === "") p = "/index.html";
+      const file = path.normalize(path.join(OUT_DIR, p));
+      // cegah path traversal keluar folder out/
+      if (!file.startsWith(OUT_DIR)) {
+        return new Response("forbidden", { status: 403 });
+      }
+      return net.fetch(pathToFileURL(file).toString());
+    } catch {
+      return new Response("not found", { status: 404 });
+    }
+  });
+
   Menu.setApplicationMenu(null);
   createWindow();
   app.on("activate", () => {
