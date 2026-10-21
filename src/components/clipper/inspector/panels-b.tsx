@@ -15,7 +15,8 @@ import { decodeAudioFile } from "@/lib/clipper/audio";
 import { trackObject } from "@/lib/clipper/tracker";
 import { FONTS } from "@/lib/clipper/typography";
 import { RESOLUTIONS, type ResolutionKey, type TextLayer } from "@/lib/clipper/types";
-import { outputDims, videoBitrate, processJob, cancelJob, newJobId } from "@/lib/clipper/exporter";
+import { outputDims, videoBitrate, cancelJob, newJobId } from "@/lib/clipper/exporter";
+import { enqueueExportJob, dequeueExportJob, setQueueCtx } from "@/lib/clipper/queue";
 import { fmtTime, fmtSize, uid } from "@/lib/clipper/format";
 import { Panel, Chip, Range, TextInput, ActionBtn, Progress, Note, Row } from "../bits";
 
@@ -276,11 +277,19 @@ export function ExportPanel() {
   const mediaAll = useClipper((s) => s.media);
   const parts = useClipper((s) => (s.selectedId ? s.parts[s.selectedId] : undefined)) ?? [];
   const addJob = useClipper((s) => s.addJob);
-  const updateJob = useClipper((s) => s.updateJob);
-  const getMedia = (id: string) => useClipper.getState().media.find((m) => m.id === id);
+  const removeJob = useClipper((s) => s.removeJob);
   const setToast = useClipper((s) => s.setToast);
 
   const jobs = useClipper((s) => s.jobs);
+
+  /* v1.2.6 — konteks antrean global: bertahan walau panel ditutup/pindah tab,
+     dan dipakai bersama panel AI MOMEN (dulu 2 jalur paralel = 2 encoding
+     bersamaan = RAM meledak). */
+  setQueueCtx({
+    getMedia: (id) => useClipper.getState().media.find((m) => m.id === id),
+    getClip: () => useClipper.getState().settings,
+    update: (id, p) => useClipper.getState().updateJob(id, p),
+  });
 
   const dims = useMemo(
     () => outputDims(clip.export, media?.width || 1920, media?.height || 1080),
@@ -319,28 +328,9 @@ export function ExportPanel() {
       status: "queued" as const, progress: 0, stage: "Menunggu antrean…",
     };
     addJob(job);
-    // proses langsung (satu job berjalan; antrean sederhana via flag)
-    void processJobQueue(job.id);
-  };
-
-  const runningRef = useRef(false);
-  const pendingRef = useRef<string[]>([]);
-  const processJobQueue = async (firstId: string) => {
-    pendingRef.current.push(firstId);
-    if (runningRef.current) return;
-    runningRef.current = true;
-    while (pendingRef.current.length) {
-      const id = pendingRef.current.shift()!;
-      const job = useClipper.getState().jobs.find((j) => j.id === id);
-      if (!job) continue;
-      await processJob(
-        job,
-        getMedia,
-        useClipper.getState().settings,
-        (p) => updateJob(id, p)
-      );
-    }
-    runningRef.current = false;
+    // v1.2.6 — antrean serial GLOBAL (satu job berjalan kapan pun,
+    // bertahan meski panel ditutup / pindah tab)
+    enqueueExportJob(job);
   };
 
   const videoMedia = mediaAll.filter((m) => m.type === "video");
@@ -465,7 +455,12 @@ export function ExportPanel() {
                   <button className="text-[10px] text-primary hover:brightness-125"
                     onClick={() => cancelJob(j.id)}>BATAL</button>
                 ) : (
-                  <button className="text-muted-foreground hover:text-primary" onClick={() => updateJob(j.id, { status: "done" })}>
+                  <button className="text-muted-foreground hover:text-primary"
+                    title={j.status === "queued" ? "Batalkan antrean" : "Hapus dari daftar"}
+                    onClick={() => {
+                      if (j.status === "queued") dequeueExportJob(j.id);
+                      removeJob(j.id);
+                    }}>
                     <X size={12} />
                   </button>
                 )}

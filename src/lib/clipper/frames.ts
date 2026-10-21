@@ -6,37 +6,95 @@
    Dipakai scene detection, zoom pembicara, tracker, ekspor.
    ============================================================ */
 
-/** seek presisi: set currentTime dan tunggu frame benar-benar siap */
-export function seekVideo(v: HTMLVideoElement, t: number): Promise<void> {
+/* ============================================================
+   v1.2.6 — ANTI-FREEZE
+   Dulu seekVideo menunggu requestAnimationFrame + event "seeked"
+   TANPA batas waktu. Saat jendela di-minimize/tertutup jendela lain
+   (atau Chromium kehilangan event seeked pada file tertentu), rAF bisa
+   BERHENTI TOTAL → await seekVideo() menggantung SELAMANYA →
+   ekspor beku di frame terakhir (mis. "Encoding 270/7239… 1%"),
+   tombol BATAL tidak bereaksi, dan SELURUH ANTREAN EKSPOR MATI
+   (job berikutnya "Menunggu antrean… 0%" selamanya).
+
+   Solusi:
+   1. Kesiapan pixel TIDAK lagi bergantung pada rAF saja —
+      dirace dengan setTimeout 80 ms (timer tetap jalan di background).
+   2. Event "seeked" diberi batas waktu (default 20 dtk) → gagal JELAS,
+      job berhenti dengan pesan (antrean lanjut), bukan beku selamanya.
+   ============================================================ */
+
+const raf =
+  typeof requestAnimationFrame === "function"
+    ? requestAnimationFrame
+    : (cb: () => void) => setTimeout(cb, 16) as unknown as number;
+const caf =
+  typeof cancelAnimationFrame === "function"
+    ? cancelAnimationFrame
+    : ((h: number) => clearTimeout(h)) as (h: number) => void;
+
+/** tunggu 1 frame render — rAF dirace timer agar TIDAK PERNAH menggantung
+    saat jendela minimize (rAF bisa mati total di background) */
+function nextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    const fin = () => {
+      if (done) return;
+      done = true;
+      caf(handle);
+      clearTimeout(timer);
+      resolve();
+    };
+    const handle = raf(fin);
+    const timer = setTimeout(fin, 80); // cadangan — timer tetap hidup di background
+  });
+}
+
+/** seek presisi: set currentTime dan tunggu frame benar-benar siap.
+    timeoutMs: batas tunggu event seeked (0 = tanpa batas — hindari). */
+export function seekVideo(v: HTMLVideoElement, t: number, timeoutMs = 20000): Promise<void> {
   return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      v.removeEventListener("seeked", onSeeked);
+      v.removeEventListener("error", onErr);
+      if (timer) { clearTimeout(timer); timer = null; }
+    };
+    const onSeeked = () => {
+      cleanup();
+      // tunggu satu frame render agar pixel benar-benar siap (anti-hang)
+      nextPaint().then(resolve, () => resolve());
+    };
+    const onErr = () => {
+      cleanup();
+      reject(new Error("Gagal seek video — file mungkin rusak pada bagian ini"));
+    };
+
     if (v.readyState < 1) {
       const onMeta = () => {
         v.removeEventListener("loadedmetadata", onMeta);
-        seekVideo(v, t).then(resolve).catch(reject);
+        seekVideo(v, t, timeoutMs).then(resolve).catch(reject);
       };
       v.addEventListener("loadedmetadata", onMeta);
       return;
     }
+
     const target = Math.min(Math.max(0, t), Math.max(0, (v.duration || 0) - 0.001));
-    const onSeeked = () => {
-      cleanup();
-      // tunggu satu frame render agar pixel benar-benar siap
-      requestAnimationFrame(() => resolve());
-    };
-    const onErr = () => {
-      cleanup();
-      reject(new Error("Gagal seek video"));
-    };
-    const cleanup = () => {
-      v.removeEventListener("seeked", onSeeked);
-      v.removeEventListener("error", onErr);
-    };
     v.addEventListener("seeked", onSeeked);
     v.addEventListener("error", onErr);
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        cleanup();
+        reject(
+          new Error(
+            `Seek video macet (batas ${Math.round(timeoutMs / 1000)} dtk) pada t=${target.toFixed(2)} dtk`
+          )
+        );
+      }, timeoutMs);
+    }
     const eps = Math.abs(v.currentTime - target);
     if (eps < 0.0005 && v.readyState >= 2) {
       cleanup();
-      requestAnimationFrame(() => resolve());
+      nextPaint().then(resolve, () => resolve());
       return;
     }
     try {
@@ -45,6 +103,45 @@ export function seekVideo(v: HTMLVideoElement, t: number): Promise<void> {
       cleanup();
       reject(e instanceof Error ? e : new Error("Seek error"));
     }
+  });
+}
+
+/** buka elemen video untuk diproses — SELALU selesai (timeout + pesan jelas).
+    v1.2.6 — dulu exporter menunggu onloadedmetadata tanpa batas: media
+    gagal dibuka = job menggantung diam tanpa status. */
+export function openVideo(url: string, timeoutMs = 30000): Promise<HTMLVideoElement> {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement("video");
+    v.muted = true;
+    v.preload = "auto";
+    v.playsInline = true;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      v.onloadedmetadata = null;
+      v.onerror = null;
+      v.removeAttribute("src");
+      v.load();
+      reject(new Error("Video tidak dapat dibuka untuk diproses (timeout) — format mungkin tidak didukung"));
+    }, timeoutMs);
+    v.onloadedmetadata = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      v.onloadedmetadata = null;
+      v.onerror = null;
+      resolve(v);
+    };
+    v.onerror = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      v.onloadedmetadata = null;
+      v.onerror = null;
+      reject(new Error("Video tidak dapat dibuka untuk diproses — codec tidak didukung browser"));
+    };
+    v.src = url;
   });
 }
 
@@ -79,14 +176,9 @@ export async function sampleFrames(
   h: number,
   onProgress?: (p: number) => void
 ): Promise<HTMLCanvasElement[]> {
-  const v = document.createElement("video");
-  v.src = url;
-  v.muted = true;
-  v.preload = "auto";
-  v.playsInline = true;
-  await new Promise<void>((res, rej) => {
-    v.onloadedmetadata = () => res();
-    v.onerror = () => rej(new Error("Tidak dapat membuka video untuk sampling"));
+  // v1.2.6 — openVideo: selalu ada batas waktu + pesan jelas
+  const v = await openVideo(url, 30000).catch((e) => {
+    throw e instanceof Error ? e : new Error("Tidak dapat membuka video untuk sampling");
   });
   const out: HTMLCanvasElement[] = [];
   try {

@@ -12,13 +12,33 @@ function ctx(): AudioContext {
   return sharedCtx;
 }
 
-export async function decodeAudioFile(url: string): Promise<AudioBuffer> {
-  const res = await fetch(url);
-  const arr = await res.arrayBuffer();
-  try {
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  const race = Promise.race([
+    p,
+    new Promise<never>((_, rej) => {
+      t = setTimeout(() => rej(new Error(`${label} melebihi ${Math.round(ms / 1000)} dtk`)), ms);
+    }),
+  ]);
+  return race.finally(() => clearTimeout(t)) as Promise<T>;
+}
+
+/** decode audio 48 kHz untuk ekspor/mixing.
+    v1.2.6 — dulu fetch + decodeAudioData TANPA batas waktu: bila fetch/decode
+    menggantung, job ekspor diam selamanya di "Menyiapkan encoder…" tanpa pesan.
+    Kini: timeout (default 5 menit untuk file besar) + pesan jelas. */
+export async function decodeAudioFile(url: string, timeoutMs = 300_000): Promise<AudioBuffer> {
+  const work = (async () => {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Gagal membaca media (${res.status})`);
+    const arr = await res.arrayBuffer();
     return await ctx().decodeAudioData(arr);
+  })();
+  try {
+    return await withTimeout(work, timeoutMs, "Membaca audio video");
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (/melebihi \d+ dtk/.test(msg)) throw e;
     if (/decod|encoding|unable/i.test(msg)) {
       throw new Error(
         "Audio di file ini tidak bisa didecode browser — biasanya video .TS / .M2TS atau codec AC3/DTS. " +

@@ -205,6 +205,14 @@ export function whisperSetGpu(v: GpuPref) {
 
 let worker: Worker | null = null;
 let activeReject: ((e: Error) => void) | null = null;
+/* v1.2.6 — FLAG INFERENSI AKTIF. Dulu transcribe() memblokir dengan
+   memeriksa runState.running — TAPI sejak v1.2.4 fase PERSIAPAN
+   (whisperNote "Membaca audio…") juga menyetel running=true, sehingga
+   begitu audio selesai dibaca, transcribe() SELALU melempar
+   "Transkripsi sudah berjalan" → subtitle GAGAL INSTAN setiap klik,
+   toast-nya hilang dalam 6 detik sehingga terlihat seperti beku.
+   Inilah akar "berhenti di 129 MB dan tidak jalan lagi". */
+let inferenceActive = false;
 
 function spawnWorker(): Worker {
   if (worker) return worker;
@@ -268,9 +276,30 @@ export async function transcribe(
     onMeta?: (meta: TranscribeMeta) => void;
   }
 ): Promise<WhisperResult> {
-  if (runState.running) {
+  // v1.2.6 — hanya tolak bila INFERENSI worker benar-benar sedang berjalan
+  // (bukan fase persiapan decode audio). Tombol panel juga disabled saat
+  // running — lapis ini hanya pengaman ekstra.
+  if (inferenceActive) {
     throw new Error("Transkripsi sudah berjalan — tunggu selesai atau tekan BATAL.");
   }
+  inferenceActive = true;
+  try {
+    return await transcribeInner(audio16k, opts);
+  } finally {
+    inferenceActive = false;
+  }
+}
+
+async function transcribeInner(
+  audio16k: Float32Array,
+  opts: {
+    model: WhisperModel;
+    language: "id" | "en" | "auto";
+    task?: "transcribe" | "translate";
+    onProgress?: (p: number, stage: string) => void;
+    onMeta?: (meta: TranscribeMeta) => void;
+  }
+): Promise<WhisperResult> {
   const w = spawnWorker();
   setState({ running: true, p: 0.01, stage: "Menyiapkan mesin AI di worker…", meta: {} });
 

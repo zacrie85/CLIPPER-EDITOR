@@ -285,6 +285,11 @@ function drawSubtitle(
     } else cur = test;
   }
   if (cur) lines.push(cur);
+  // v1.2.6 — teks kosong/whitespace → tidak ada baris; dulu Math.max([]) = -Infinity
+  if (!lines.length) {
+    ctx.restore();
+    return;
+  }
 
   const lineH = size * 1.25;
   const totalH = lines.length * lineH;

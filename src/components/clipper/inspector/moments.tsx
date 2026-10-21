@@ -12,7 +12,8 @@ import { useClipper } from "@/lib/clipper/store";
 import { analyzeMoments } from "@/lib/clipper/momentfinder";
 import { detectScenes } from "@/lib/clipper/scenedetect";
 import { decodeAudioFile, rmsEnvelope } from "@/lib/clipper/audio";
-import { processJob, newJobId } from "@/lib/clipper/exporter";
+import { newJobId } from "@/lib/clipper/exporter";
+import { enqueueExportJob, setQueueCtx } from "@/lib/clipper/queue";
 import { fmtTime, uid, safeName } from "@/lib/clipper/format";
 import { Panel, Chip, ActionBtn, Progress, Note } from "../bits";
 import type { MediaItem, Part } from "@/lib/clipper/types";
@@ -50,8 +51,6 @@ export function MomentsPanel() {
   const setPlaying = useClipper((s) => s.setPlaying);
   const setBusy = useClipper((s) => s.setBusy);
   const setToast = useClipper((s) => s.setToast);
-  const addJob = useClipper((s) => s.addJob);
-  const updateJob = useClipper((s) => s.updateJob);
   const cues = useClipper((s) => s.settings.subtitle.cues);
   const moments = useClipper((s) => (s.selectedId ? s.moments[s.selectedId] : undefined)) ?? [];
   const [lensSel, setLensSel] = useState<number | "auto">("auto");
@@ -77,10 +76,16 @@ export function MomentsPanel() {
       progress: 0,
       stage: "Menunggu antrean…",
     };
-    addJob(job);
-    void processJob(job, (id) => st.media.find((m) => m.id === id), st.settings, (p) =>
-      updateJob(job.id, p)
-    );
+    st.addJob(job);
+    /* v1.2.6 — dulu job momen dipanggil LANGSUNG tanpa antrean: bisa berjalan
+       BERSAMAAN dengan job di panel Ekspor → 2 encoding serentak → RAM meledak
+       & ekspor saling ganggu. Kini satu antrean global serial. */
+    setQueueCtx({
+      getMedia: (id) => useClipper.getState().media.find((m) => m.id === id),
+      getClip: () => useClipper.getState().settings,
+      update: (id, p) => useClipper.getState().updateJob(id, p),
+    });
+    enqueueExportJob(job);
   };
 
   const run = async () => {

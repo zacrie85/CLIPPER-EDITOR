@@ -74,7 +74,15 @@ export function SplitPanel() {
   };
 
   const patchPart = (id: string, idx: number, v: number) => {
-    const next = parts.map((p, i) => (i === idx ? { ...p, [id]: Math.max(0, Math.min(media?.duration ?? v, v)) } : p));
+    // v1.2.6 — cegah rentang terbalik (start ≥ end) yang membuat
+    // "Rentang ekspor kosong" saat EKSPOR PARTS
+    const dur = media?.duration ?? v;
+    const next = parts.map((p, i) => {
+      if (i !== idx) return p;
+      const val = Math.max(0, Math.min(dur, v));
+      if (id === "start") return { ...p, start: Math.min(val, p.end - 0.1) };
+      return { ...p, end: Math.max(val, p.start + 0.1) };
+    });
     setParts(media!.id, next);
   };
 

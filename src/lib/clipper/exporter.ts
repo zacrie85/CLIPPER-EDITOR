@@ -13,12 +13,84 @@ import {
   type ExportSettings, type MediaItem, type SpeakerSegment,
 } from "./types";
 import { drawComposite } from "./render";
-import { seekVideo, makeCanvas } from "./frames";
+import { seekVideo, makeCanvas, openVideo } from "./frames";
 import { decodeAudioFile, renderMix } from "./audio";
 import { composeMusic } from "./music";
 import { analyzeSpeaker, buildCropKeys, type SpeakerAnalysis } from "./speaker";
 import { ensureFontsLoaded } from "./typography";
 import { downloadBlob, safeName, uid } from "./format";
+
+/* ============================================================
+   v1.2.6 — ANTI-FREEZE EKSPOR
+   Laporan: "Encoding video 270/7239… 1%" beku + job lain mati di
+   "Menunggu antrean… 0%" selamanya + tombol BATAL tidak bereaksi.
+
+   Akar masalah yang diperbaiki di file ini:
+   1. await seekVideo() bisa menggantung selamanya (rAF mati saat
+      window minimize / event seeked hilang) → kini dilindungi
+      raceStall(): batas waktu 45 dtk + BATAL tetap bereaksi.
+   2. Tunggu onloadedmetadata video tanpa batas → kini openVideo()
+      dengan timeout + pesan jelas.
+   3. Loop backpressure encoder bisa berputar selamanya bila encoder
+      mati → kini dibatasi 30 dtk + cek encodeErr/state tiap putaran.
+   4. EKSPOR PARTS menumpuk SEMUA blob di RAM dulu (20 bagian ×
+      ratusan MB = OOM crash) → kini tiap bagian DIUNDUH SEGERA.
+   5. EKSPOR PARTS decode audio penuh 48 kHz BERULANG per bagian
+      (20× decode!) → kini dibaca SEKALI untuk semua bagian.
+   6. BATCH SEMUA hanya memakai media[0] untuk semua range →
+      output video ke-2 dst SALAH → kini tiap video diproses sendiri.
+   7. GABUNG VIDEO: timestamp audio mulai dari 0 per sumber →
+      audio saling tumpang → kini offset global berjalan.
+   ============================================================ */
+
+/** lindungi promise dari menggantung selamanya: batas waktu + BATAL aktif.
+    isCancelled dicek tiap 250 ms — tombol BATALKAN bekerja bahkan saat
+    seek/encode sedang macet. */
+function raceStall<T>(
+  p: Promise<T>,
+  isCancelled: (() => boolean) | undefined,
+  ms: number,
+  err: Error
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let iv: ReturnType<typeof setInterval> | null = null;
+    const cleanup = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (iv) { clearInterval(iv); iv = null; }
+    };
+    if (isCancelled) {
+      iv = setInterval(() => {
+        if (!done && isCancelled()) {
+          done = true;
+          cleanup();
+          reject(new Error("Dibatalkan"));
+        }
+      }, 250);
+    }
+    timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(err);
+    }, ms);
+    p.then(
+      (v) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve(v);
+      },
+      (e) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    );
+  });
+}
 
 /* ---------- cache analisis pembicara per media ---------- */
 const speakerCache = new Map<string, SpeakerAnalysis>();
@@ -112,6 +184,10 @@ export interface ExportOneOptions {
   name: string;
   onProgress?: (p: number, stage: string) => void;
   shouldCancel?: () => boolean;
+  /** v1.2.6 — audio 48 kHz hasil decode pemanggil (null = video tanpa audio).
+      undefined = decode di sini (perilaku lama). Dipakai EKSPOR PARTS agar
+      audio dibaca SEKALI untuk semua bagian, bukan N× decode penuh. */
+  audioPre?: AudioBuffer | null;
 }
 
 export async function exportOne(opts: ExportOneOptions): Promise<Blob> {
@@ -153,10 +229,16 @@ export async function exportOne(opts: ExportOneOptions): Promise<Blob> {
   let audioSetup: AudioSetup | null = null;
   let mixed: AudioBuffer | null = null;
   let original: AudioBuffer | null = null;
-  try {
-    original = media.type === "video" ? await decodeAudioFile(media.url) : null;
-  } catch {
-    original = null;
+  if (opts.audioPre !== undefined) {
+    // v1.2.6 — sudah di-decode pemanggil (sekali untuk semua bagian split)
+    original = opts.audioPre;
+  } else {
+    try {
+      opts.onProgress?.(0.02, "Membaca audio video…");
+      original = media.type === "video" ? await decodeAudioFile(media.url) : null;
+    } catch {
+      original = null;
+    }
   }
 
   let musicBuf: AudioBuffer | null = null;
@@ -245,15 +327,8 @@ export async function exportOne(opts: ExportOneOptions): Promise<Blob> {
 
   /* ----- render frame per frame ----- */
   const canvas = makeCanvas(dims.w, dims.h);
-  const v = document.createElement("video");
-  v.src = media.url;
-  v.muted = true;
-  v.preload = "auto";
-  v.playsInline = true;
-  await new Promise<void>((res, rej) => {
-    v.onloadedmetadata = () => res();
-    v.onerror = () => rej(new Error("Video tidak dapat dibuka untuk ekspor"));
-  });
+  // v1.2.6 — openVideo: selalu ada batas waktu + pesan jelas
+  const v = await openVideo(media.url, 30000);
 
   // siapkan keyframe zoom pembicara bila aktif
   let keys: CropKey[] | null = null;
@@ -276,9 +351,22 @@ export async function exportOne(opts: ExportOneOptions): Promise<Blob> {
         throw new Error("Dibatalkan");
       }
       if (encodeErr) throw encodeErr;
+      if (venc.state !== "configured") {
+        throw new Error("Encoder video berhenti di tengah proses (driver/GPU) — coba ENCODER → CPU");
+      }
 
       const t = range.start + i / fps;
-      await seekVideo(v, t);
+      // v1.2.6 — seek dilindungi batas waktu 45 dtk + tombol BATAL tetap hidup.
+      // Dulu: seek menggantung selamanya (rAF mati saat window minimize) →
+      // job beku di frame terakhir dan seluruh antrean mati.
+      await raceStall(
+        seekVideo(v, t),
+        opts.shouldCancel,
+        45_000,
+        new Error(
+          `Seek frame ${done + 1}/${totalFrames} (t=${t.toFixed(2)} dtk) macet >45 dtk — job dihentikan otomatis`
+        )
+      );
       drawComposite({
         src: v,
         srcW: v.videoWidth || media.width,
@@ -310,9 +398,19 @@ export async function exportOne(opts: ExportOneOptions): Promise<Blob> {
           `Encoding video ${done}/${totalFrames} frame · ${dims.w}×${dims.h}`
         );
         // beri napas UI & flush antrean agar mem stabil
+        // v1.2.6 — tunggu antrean dibatasi 30 dtk + cek error encoder tiap putaran
         if (venc.encodeQueueSize > 12) {
           await new Promise((r) => setTimeout(r, 0));
+          const t0 = Date.now();
           while (venc.encodeQueueSize > 6) {
+            if (encodeErr) throw encodeErr;
+            if (venc.state !== "configured") {
+              throw new Error("Encoder video berhenti (antrean tidak berkurang) — coba ENCODER → CPU");
+            }
+            if (opts.shouldCancel?.()) throw new Error("Dibatalkan");
+            if (Date.now() - t0 > 30_000) {
+              throw new Error("Encoder video macet (antrean encode tidak berkurang 30 dtk) — job dihentikan otomatis");
+            }
             await new Promise((r) => setTimeout(r, 8));
           }
         } else {
@@ -349,7 +447,16 @@ export async function exportOne(opts: ExportOneOptions): Promise<Blob> {
       });
       aenc.encode(ad);
       ad.close();
-      if (aenc.encodeQueueSize > 16) await new Promise((r) => setTimeout(r, 4));
+      // v1.2.6 — antrean audio benar-benar dikuras (dulu cuma sleep 4 ms
+      // tanpa menunggu → bisa membengkak di video panjang)
+      if (aenc.encodeQueueSize > 16) {
+        const t0 = Date.now();
+        while (aenc.encodeQueueSize > 8) {
+          if (encodeErr) throw encodeErr;
+          if (Date.now() - t0 > 30_000) throw new Error("Encoder audio macet — job dihentikan otomatis");
+          await new Promise((r) => setTimeout(r, 4));
+        }
+      }
     }
     await aenc.flush();
     aenc.close();
@@ -416,25 +523,80 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
     if (job.target === "split") {
       // ekspor tiap bagian sebagai file terpisah
       const parts = rangesAll;
-      const results: { name: string; blob: Blob }[] = [];
+      /* v1.2.6 — audio 48 kHz dibaca SEKALI untuk semua bagian.
+         Dulu: tiap bagian melakukan fetch + decode penuh berulang
+         (20 bagian = 20× decode video panjang) → lambat & RAM meledak. */
+      let audioPre: AudioBuffer | null = null;
+      if (media[0].type === "video") {
+        update({ stage: `Membaca audio (sekali untuk ${parts.length} bagian)…`, progress: 0.004 });
+        try {
+          audioPre = await decodeAudioFile(media[0].url);
+        } catch {
+          audioPre = null; // tanpa audio / codec aneh → lanjut tanpa audio
+        }
+      }
+      let ok = 0;
       for (let i = 0; i < parts.length; i++) {
+        if (cancelFlags.has(job.id)) throw new Error("Dibatalkan");
         const r = parts[i];
         const blob = await exportOne({
           media: media[0],
           ranges: [{ start: r.start, end: r.end }],
           clip: clip,
           name: `${job.name}_part${String(i + 1).padStart(2, "0")}`,
+          audioPre,
           onProgress: (p, stage) =>
             update({ progress: (i + p) / parts.length * 0.99, stage: `Bagian ${i + 1}/${parts.length} — ${stage}` }),
           shouldCancel: () => cancelFlags.has(job.id),
         });
-        results.push({ name: `${safeName(job.name)}_BAGIAN_${String(i + 1).padStart(2, "0")}.mp4`, blob });
+        /* v1.2.6 — tiap bagian DIUNDUH SEGERA setelah jadi.
+           Dulu semua blob ditumpuk di RAM sampai bagian terakhir
+           (20 × ratusan MB) → renderer OOM crash di tengah proses. */
+        downloadBlob(blob, `${safeName(job.name)}_BAGIAN_${String(i + 1).padStart(2, "0")}.mp4`);
+        ok++;
+        await new Promise((res) => setTimeout(res, 600));
       }
-      for (const r of results) {
-        downloadBlob(r.blob, r.name);
-        await new Promise((res) => setTimeout(res, 700));
+      update({ status: "done", progress: 1, stage: `${ok} file terunduh`, finishedAt: Date.now() });
+      return;
+    }
+
+    if (job.target === "batch") {
+      /* v1.2.6 — BUG LAMA: batch memakai media[0] untuk SEMUA range →
+         video ke-2 dst ter-export SALAH (frame video pertama di-clamp).
+         Kini tiap video diproses sendiri + diunduh segera. */
+      let ok = 0;
+      const gagal: string[] = [];
+      for (let i = 0; i < rangesAll.length; i++) {
+        if (cancelFlags.has(job.id)) throw new Error("Dibatalkan");
+        const r = rangesAll[i];
+        const m = media[i] ?? media[0];
+        try {
+          const blob = await exportOne({
+            media: m,
+            ranges: [{ start: r.start, end: r.end }],
+            clip: { ...clip },
+            name: `${job.name}_video${String(i + 1).padStart(2, "0")}`,
+            onProgress: (p, stage) =>
+              update({
+                progress: (i + p) / rangesAll.length * 0.99,
+                stage: `Video ${i + 1}/${rangesAll.length} (${m.name.slice(0, 24)}) — ${stage}`,
+              }),
+            shouldCancel: () => cancelFlags.has(job.id),
+          });
+          downloadBlob(blob, `${safeName(m.name)}_${String(i + 1).padStart(2, "0")}.mp4`);
+          ok++;
+          await new Promise((res) => setTimeout(res, 600));
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (msg === "Dibatalkan") throw e;
+          gagal.push(`${m.name.slice(0, 24)}: ${msg.slice(0, 80)}`);
+        }
       }
-      update({ status: "done", progress: 1, stage: `${results.length} file terunduh`, finishedAt: Date.now() });
+      if (!ok) throw new Error(gagal.join(" · ") || "Semua video gagal");
+      update({
+        status: "done", progress: 1, finishedAt: Date.now(),
+        stage: `${ok}/${rangesAll.length} video terunduh${gagal.length ? ` · ${gagal.length} gagal` : ""}`,
+      });
       return;
     }
 
@@ -545,16 +707,15 @@ async function exportMulti(
   const totalFrames = Math.ceil(totalDur * fps);
   let done = 0;
   let outTs = 0;
+  /* v1.2.6 — timestamp audio GLOBAL: dulu mulai dari 0 per sumber,
+     sehingga audio video ke-2 menimpa audio video pertama di muxer
+     (output rusak/saling tumpang). Kini offset berjalan sepanjang gabungan. */
+  let audioTsUs = 0;
 
   for (const src of sources) {
-    const v = document.createElement("video");
-    v.src = src.media.url;
-    v.muted = true;
-    v.preload = "auto";
-    v.playsInline = true;
-    await new Promise<void>((res, rej) => {
-      v.onloadedmetadata = () => res();
-      v.onerror = () => rej(new Error(`Tidak dapat membuka ${src.media.name}`));
+    // v1.2.6 — openVideo: batas waktu + pesan jelas per sumber
+    const v = await openVideo(src.media.url, 30000).catch((e) => {
+      throw new Error(`${src.media.name}: ${e instanceof Error ? e.message : e}`);
     });
 
     let keys: CropKey[] | null = null;
@@ -600,8 +761,17 @@ async function exportMulti(
           throw new Error("Dibatalkan");
         }
         if (encodeErr) throw encodeErr;
+        if (venc.state !== "configured") {
+          throw new Error("Encoder video berhenti di tengah proses — coba ENCODER → CPU");
+        }
         const t = range.start + i / fps;
-        await seekVideo(v, t);
+        // v1.2.6 — seek dilindungi batas waktu + BATAL tetap bereaksi
+        await raceStall(
+          seekVideo(v, t),
+          shouldCancel,
+          45_000,
+          new Error(`Seek macet >45 dtk (t=${t.toFixed(2)} dtk) — job dihentikan otomatis`)
+        );
         drawComposite({
           src: v,
           srcW: v.videoWidth || src.media.width,
@@ -630,8 +800,8 @@ async function exportMulti(
       }
     }
 
-    // audio segmen ini
-    if (mixedSeg) {
+    // audio segmen ini — timestamp GLOBAL (v1.2.6)
+    if (mixedSeg && audioSetup) {
       const sr = mixedSeg.sampleRate;
       const chunkFrames = 4800;
       const chans = Math.min(2, mixedSeg.numberOfChannels);
@@ -644,11 +814,21 @@ async function exportMulti(
         }
         const ad = new AudioData({
           format: "f32-planar", sampleRate: sr, numberOfFrames: n,
-          numberOfChannels: chans, timestamp: Math.round((off / sr) * 1e6), data,
+          numberOfChannels: chans,
+          timestamp: Math.round(audioTsUs + (off / sr) * 1e6), data,
         });
         aenc.encode(ad);
         ad.close();
+        if (aenc.encodeQueueSize > 16) {
+          const t0 = Date.now();
+          while (aenc.encodeQueueSize > 8) {
+            if (encodeErr) throw encodeErr;
+            if (Date.now() - t0 > 30_000) throw new Error("Encoder audio macet — job dihentikan otomatis");
+            await new Promise((r) => setTimeout(r, 4));
+          }
+        }
       }
+      audioTsUs += Math.round((mixedSeg.length / sr) * 1e6);
     }
 
     v.removeAttribute("src");
@@ -658,8 +838,10 @@ async function exportMulti(
   onProgress?.(0.96, "Finalisasi…");
   await venc.flush();
   venc.close();
-  await aenc.flush();
-  aenc.close();
+  if (audioSetup) {
+    await aenc.flush();
+    aenc.close();
+  }
   if (encodeErr) throw encodeErr;
   muxer.finalize();
   const blob = new Blob([target.buffer], { type: "video/mp4" });

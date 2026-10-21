@@ -1,7 +1,7 @@
 {
   "name": "clipper-editor",
   "productName": "CLIPPER EDITOR",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "description": "Editor video AI 100% OFFLINE untuk clipper — auto split scene, subtitle Whisper, zoom pembicara YOLOS, musik AI, ekspor H.264 720p-4K. Alternatif gratis Opus Clip.",
   "private": true,
   "main": "electron/main.js",
