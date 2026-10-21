@@ -28,6 +28,10 @@ export interface MomentSuggestion {
   /** alasan bahasa Indonesia, siap tampil */
   reasons: string[];
   hasTranscript: boolean;
+  /** durasi kandidat yang dipakai utk momen ini (detik) */
+  chosenLen: number;
+  /** true bila AI memilih sendiri durasi dari banyak kandidat */
+  auto: boolean;
 }
 
 export interface AnalyzeMomentsInput {
@@ -38,7 +42,7 @@ export interface AnalyzeMomentsInput {
   cues: { start: number; end: number; text: string }[];
   /** envelope RMS audio (mis. per 0,25 s) */
   envelope: { t: number; rms: number }[];
-  /** durasi kandidat (detik), mis. [15, 30, 60] */
+  /** durasi kandidat (detik). 1 angka = durasi fix; banyak angka = AI pilih sendiri */
   lens: number[];
   maxResults?: number;
 }
@@ -125,6 +129,16 @@ export function analyzeMoments(input: AnalyzeMomentsInput): MomentSuggestion[] {
   if (duration < 8) return [];
 
   const hasTranscript = cues.length > 0;
+
+  /* mode AUTO: banyak durasi kandidat → AI pilih yang terbaik per momen.
+     Bias ringan ke klip lebih pendek: dalam skor setara, klip padat
+     selalu lebih enak ditonton daripada klip bertele-tele. */
+  const lensUse = [...new Set(lens)].filter((L) => L >= 8 && L <= duration).sort((a, b) => a - b);
+  if (!lensUse.length) return [];
+  const auto = lensUse.length > 1;
+  const maxL = lensUse[lensUse.length - 1];
+  const rankOf = (c: MomentSuggestion) =>
+    c.total - (auto ? (c.chosenLen / maxL) * 2.5 : 0);
 
   // rata-rata energi global
   const globalAvg = envelope.length
@@ -276,6 +290,16 @@ export function analyzeMoments(input: AnalyzeMomentsInput): MomentSuggestion[] {
         finalReasons.push("Jalankan SUBTITLE AI dulu — analisis hook & konteks makin akurat");
       }
 
+      if (auto) {
+        const durWhy =
+          context >= 65
+            ? `Durasi AI: ${Math.round(len)} dtk — topik selesai pas di sini, nggak kepotong`
+            : hook >= pacing
+              ? `Durasi AI: ${Math.round(len)} dtk — hook & ritme paling kencang di rentang ini`
+              : `Durasi AI: ${Math.round(len)} dtk — keseimbangan hook/ritme/konteks terbaik`;
+        finalReasons.unshift(durWhy);
+      }
+
       candidates.push({
         id: `momen_${Math.round(a * 100)}_${Math.round(len)}`,
         start: Math.max(0, a),
@@ -287,6 +311,8 @@ export function analyzeMoments(input: AnalyzeMomentsInput): MomentSuggestion[] {
         hookLine,
         reasons: finalReasons.slice(0, 4),
         hasTranscript,
+        chosenLen: Math.round(len),
+        auto,
       });
     }
   }
@@ -296,8 +322,10 @@ export function analyzeMoments(input: AnalyzeMomentsInput): MomentSuggestion[] {
     c.total = Math.round(c.hook * 0.4 + c.pacing * 0.3 + c.context * 0.3);
   }
 
-  /* ----- NMS: buang yang tumpang tindih, ambil terbaik ----- */
-  candidates.sort((x, y) => y.total - x.total);
+  /* ----- NMS: buang yang tumpang tindih, ambil terbaik -----
+     mode auto: urutan pakai rank (skor − bias durasi) supaya di
+     antara kandidat setara, versi lebih pendek yang menang ----- */
+  candidates.sort((x, y) => rankOf(y) - rankOf(x));
   const picked: MomentSuggestion[] = [];
   for (const c of candidates) {
     const ok = picked.every((p) => {

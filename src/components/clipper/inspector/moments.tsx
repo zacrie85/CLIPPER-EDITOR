@@ -18,10 +18,11 @@ import { Panel, Chip, ActionBtn, Progress, Note } from "../bits";
 import type { MediaItem, Part } from "@/lib/clipper/types";
 import type { MomentSuggestion } from "@/lib/clipper/momentfinder";
 
-const LENS = [
-  { key: 15, label: "SHORT 15s" },
-  { key: 30, label: "MEDIUM 30s" },
-  { key: 60, label: "LONG 60s" },
+const LENS: { key: number | "auto"; label: string }[] = [
+  { key: "auto", label: "⚡ AUTO AI" },
+  { key: 15, label: "15s" },
+  { key: 30, label: "30s" },
+  { key: 60, label: "60s" },
 ];
 
 function useSelected(): MediaItem | undefined {
@@ -53,7 +54,7 @@ export function MomentsPanel() {
   const updateJob = useClipper((s) => s.updateJob);
   const cues = useClipper((s) => s.settings.subtitle.cues);
   const moments = useClipper((s) => (s.selectedId ? s.moments[s.selectedId] : undefined)) ?? [];
-  const [lens, setLens] = useState(30);
+  const [lensSel, setLensSel] = useState<number | "auto">("auto");
   const [progress, setProgress] = useState(0);
   const [stage, setStage] = useState("");
   const ranRef = useRef(false);
@@ -101,17 +102,26 @@ export function MomentsPanel() {
         cuts = sc.cuts;
       }
       setStage("Menyusun skor HOOK · PACING · KONTEKS…");
+      /* AUTO: kandidat 10 dtk s/d 3 menit — AI pilih sendiri durasi
+         terbaik per momen (yang konteksnya selesai & skornya tertinggi) */
+      const lensList =
+        lensSel === "auto"
+          ? [10, 15, 20, 30, 45, 60, 90, 120, 180].filter((L) => L <= media.duration)
+          : [lensSel];
+      if (!lensList.length) lensList.push(Math.max(8, Math.floor(media.duration)));
       const res = analyzeMoments({
         duration: media.duration,
         cuts,
         cues,
         envelope: env,
-        lens: [lens],
+        lens: lensList,
       });
       setMoments(media.id, res);
       setToast(
         res.length
-          ? `${res.length} momen terbaik ditemukan${hasTranscript ? " (pakai transkrip)" : ""} — urut dari skor tertinggi`
+          ? lensSel === "auto"
+            ? `${res.length} momen ditemukan — durasi tiap momen dipilih sendiri oleh AI`
+            : `${res.length} momen terbaik ditemukan${hasTranscript ? " (pakai transkrip)" : ""} — urut dari skor tertinggi`
           : "Video terlalu pendek / belum ada momen menonjol — coba durasi lain"
       );
     } catch (e) {
@@ -140,12 +150,31 @@ export function MomentsPanel() {
   const sorted = [...moments].sort((a, b) => b.total - a.total);
   const rangesAll = sorted.map((m) => ({ mediaId: media?.id ?? "", start: m.start, end: m.end }));
 
+  /* ringkasan durasi pilihan AI — jawaban langsung "berapa menit klipnya?" */
+  const distCounts = new Map<number, number>();
+  for (const m of sorted) {
+    const d = Math.round(m.end - m.start);
+    distCounts.set(d, (distCounts.get(d) ?? 0) + 1);
+  }
+  const dist =
+    sorted.length && sorted[0].auto
+      ? [...distCounts.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([d, n]) => {
+            const label = d >= 60 ? `${(d / 60).toFixed(1).replace(".0", "")} mnt` : `${d}s`;
+            return `${n}× ${label}`;
+          })
+          .join(" · ")
+      : "";
+
   return (
     <Panel title="AI Momen Viral" icon={<Flame size={12} className="text-primary" />}>
       <Note>
         Mencari <b className="text-foreground">di bagian mana</b> video lo punya <b className="text-primary">HOOK</b>{" "}
         (pembuka nendang), <b className="text-primary">PACING</b> (ritme), dan{" "}
         <b className="text-primary">KONTEKS</b> (makna utuh) — lalu memberi skor 0–100 per segmen.
+        Pilih <b className="text-foreground">⚡ AUTO AI</b> biar <b className="text-primary">AI yang menentukan sendiri</b> berapa
+        detik/menit tiap klip (10 dtk – 3 menit) — nggak perlu mikir.
         Sinyal: transkrip Whisper {hasTranscript ? "✓ tersedia" : "(belum ada)"} + energi audio + potongan adegan.
         100% offline.
       </Note>
@@ -154,7 +183,7 @@ export function MomentsPanel() {
         <span className="clip-label shrink-0">DURASI KLIP</span>
         <div className="flex gap-1 flex-wrap justify-end">
           {LENS.map((l) => (
-            <Chip key={l.key} active={lens === l.key} onClick={() => setLens(l.key)}>
+            <Chip key={String(l.key)} active={lensSel === l.key} onClick={() => setLensSel(l.key)}>
               {l.label}
             </Chip>
           ))}
@@ -196,6 +225,12 @@ export function MomentsPanel() {
             </ActionBtn>
           </div>
 
+          {dist && (
+            <div className="text-[10px] text-muted-foreground">
+              <span className="text-primary font-bold">⚡ AI pilih durasi:</span> {dist}
+            </div>
+          )}
+
           <div className="space-y-2 max-h-[26rem] overflow-y-auto pr-1">
             {sorted.map((m, i) => (
               <div key={m.id} className="border border-border rounded p-2 space-y-1.5 bg-secondary/30">
@@ -208,9 +243,18 @@ export function MomentsPanel() {
                   >
                     {fmtTime(m.start)} → {fmtTime(m.end)}
                   </button>
-                  <span className="text-[9.5px] text-muted-foreground">
-                    {(m.end - m.start).toFixed(0)}s
-                  </span>
+                  {m.auto ? (
+                    <span
+                      className="text-[9px] font-bold text-primary border border-primary/40 bg-primary/10 rounded px-1 py-px tabular-nums"
+                      title="Durasi ini dipilih sendiri oleh AI"
+                    >
+                      AI {Math.round(m.end - m.start)}s
+                    </span>
+                  ) : (
+                    <span className="text-[9.5px] text-muted-foreground">
+                      {(m.end - m.start).toFixed(0)}s
+                    </span>
+                  )}
                   <span className="ml-auto text-[13px] font-bold text-foreground tabular-nums">
                     {m.total}
                     <span className="text-[9px] text-muted-foreground">/100</span>

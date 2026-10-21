@@ -28,7 +28,7 @@ Semua decoding, analisis AI, dan encoding terjadi di device lo sendiri.
 | 8 | **Rasio 9:16 / 16:9** | 9:16 dibalik ala TikTok (4K vertikal = 2160×3840) · pan & zoom manual pakai panah |
 | 9 | **Zoom pembicara otomatis** | 3 sinyal: **YOLOS-tiny ONNX** (±10 MB, unduh sekali) + gerakan mulut/kepala + aktivitas audio · transisi GESER HALUS / FADE / LANGSUNG · fallback auto 2-bagian |
 | 10 | **Scene detect** | Analisis piksel + histogram, ambang adaptif **median+MAD** — potong pas di pergantian adegan, bukan durasi patokan |
-| 11 | **AI Momen Viral** | Mencari **di bagian mana** video punya **HOOK · PACING · KONTEKS** — skor 0–100 per segmen dari transkrip Whisper + energi audio + adegan; langsung PUTAR / POTONG / EKSPOR / GABUNG semua momen |
+| 11 | **AI Momen Viral + AUTO DURASI** | Mencari **di bagian mana** video punya **HOOK · PACING · KONTEKS** — skor 0–100 per segmen dari transkrip Whisper + energi audio + adegan; mode **⚡ AUTO AI** menentukan sendiri durasi tiap klip (10 dtk–3 mnt) sesuai selesainya topik; langsung PUTAR / POTONG / EKSPOR / GABUNG semua momen |
 
 ## 🔒 Kenapa offline?
 
