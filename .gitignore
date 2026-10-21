@@ -72,3 +72,4 @@ server.log
 verify-*.png
 # electron build output
 /release/
+upload/
