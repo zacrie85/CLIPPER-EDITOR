@@ -11,6 +11,7 @@ import {
   defaultSettings, type ClipSettings, type ExportJob, type MediaItem,
   type ModelStatus, type Part, type SplitMode, type TextLayer,
 } from "./types";
+import type { MomentSuggestion } from "./momentfinder";
 import { uid } from "./format";
 
 const LS_KEY = "clipper-editor-settings-v1";
@@ -47,6 +48,7 @@ interface ClipperState {
   media: MediaItem[];
   selectedId: string | null;
   parts: Record<string, Part[]>; // per mediaId
+  moments: Record<string, MomentSuggestion[]>; // hasil AI MOMEN per mediaId
   settings: ClipSettings;
   jobs: ExportJob[];
   models: ModelStatus;
@@ -66,6 +68,7 @@ interface ClipperState {
 
   setParts: (mediaId: string, parts: Part[]) => void;
   partsOf: (mediaId: string) => Part[];
+  setMoments: (mediaId: string, m: MomentSuggestion[]) => void;
 
   patch: (p: Partial<ClipSettings>) => void;
   patchSplit: (p: Partial<ClipSettings["split"]>) => void;
@@ -100,6 +103,7 @@ export const useClipper = create<ClipperState>((set, get) => ({
   media: [],
   selectedId: null,
   parts: {},
+  moments: {},
   settings: { ...defaultSettings(), ...(loadPersisted() ?? {}) },
   jobs: [],
   models: { whisper: "idle", whisperProgress: 0, whisperReady: null, detector: "idle", detectorProgress: 0 },
@@ -118,8 +122,10 @@ export const useClipper = create<ClipperState>((set, get) => ({
       const media = s.media.filter((x) => x.id !== id);
       const parts = { ...s.parts };
       delete parts[id];
+      const moments = { ...s.moments };
+      delete moments[id];
       return {
-        media, parts,
+        media, parts, moments,
         selectedId: s.selectedId === id ? media[0]?.id ?? null : s.selectedId,
       };
     }),
@@ -128,6 +134,7 @@ export const useClipper = create<ClipperState>((set, get) => ({
 
   setParts: (mediaId, parts) => set((s) => ({ parts: { ...s.parts, [mediaId]: parts } })),
   partsOf: (mediaId) => get().parts[mediaId] ?? [],
+  setMoments: (mediaId, m) => set((s) => ({ moments: { ...s.moments, [mediaId]: m } })),
 
   patch: (p) =>
     set((s) => {

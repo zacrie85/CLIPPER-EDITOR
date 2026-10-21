@@ -7,7 +7,7 @@
 
 import { useEffect } from "react";
 import {
-  Scissors, Captions, Users, Music, Type, Target, Package, Clapperboard, Zap,
+  Scissors, Captions, Users, Music, Type, Target, Package, Clapperboard, Zap, Flame,
 } from "lucide-react";
 import { useClipper } from "@/lib/clipper/store";
 import { MediaBar } from "./mediabar";
@@ -16,6 +16,7 @@ import { Timeline } from "./timeline";
 import { StatusBar } from "./statusbar";
 import { SplitPanel, SubtitlePanel, SpeakerPanel } from "./inspector/panels-a";
 import { MusicPanel, TextPanel, TrackerPanel, ExportPanel } from "./inspector/panels-b";
+import { MomentsPanel } from "./inspector/moments";
 import { Chip } from "./bits";
 
 const TABS = [
@@ -25,6 +26,7 @@ const TABS = [
   { key: "music", label: "MUSIK", icon: Music },
   { key: "text", label: "TEKS", icon: Type },
   { key: "tracker", label: "LACAK", icon: Target },
+  { key: "moments", label: "AI MOMEN", icon: Flame },
   { key: "export", label: "EKSPOR", icon: Package },
 ];
 
@@ -105,6 +107,7 @@ export function EditorShell() {
             {tab === "music" && <MusicPanel />}
             {tab === "text" && <TextPanel />}
             {tab === "tracker" && <TrackerPanel />}
+            {tab === "moments" && <MomentsPanel />}
             {tab === "export" && <ExportPanel />}
           </div>
         </aside>

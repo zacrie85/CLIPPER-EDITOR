@@ -1,7 +1,7 @@
 # 🎬 CLIPPER EDITOR
 
 > **Editor video AI 100% OFFLINE untuk clipper** — alternatif gratis & privat dari Opus Clip dkk.
-> Auto-split scene · Subtitle AI (Whisper) · Zoom pembicara (YOLOS) · Musik AI · Ekspor H.264 s/d 4K
+> AI Momen Viral · Auto-split scene · Subtitle AI (Whisper) · Zoom pembicara (YOLOS) · Musik AI · Ekspor H.264 s/d 4K
 
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Browser-ff2d2d?style=flat-square)
 ![offline](https://img.shields.io/badge/AI-100%25%20offline-white?style=flat-square)
@@ -28,6 +28,7 @@ Semua decoding, analisis AI, dan encoding terjadi di device lo sendiri.
 | 8 | **Rasio 9:16 / 16:9** | 9:16 dibalik ala TikTok (4K vertikal = 2160×3840) · pan & zoom manual pakai panah |
 | 9 | **Zoom pembicara otomatis** | 3 sinyal: **YOLOS-tiny ONNX** (±10 MB, unduh sekali) + gerakan mulut/kepala + aktivitas audio · transisi GESER HALUS / FADE / LANGSUNG · fallback auto 2-bagian |
 | 10 | **Scene detect** | Analisis piksel + histogram, ambang adaptif **median+MAD** — potong pas di pergantian adegan, bukan durasi patokan |
+| 11 | **AI Momen Viral** | Mencari **di bagian mana** video punya **HOOK · PACING · KONTEKS** — skor 0–100 per segmen dari transkrip Whisper + energi audio + adegan; langsung PUTAR / POTONG / EKSPOR / GABUNG semua momen |
 
 ## 🔒 Kenapa offline?
 
@@ -74,6 +75,7 @@ src/
   lib/clipper/          ← engine inti
     media.ts frames.ts scenedetect.ts    impor · seek presisi · scene detect
     whisper.ts detection.ts speaker.ts   subtitle AI · YOLOS · zoom pembicara
+    momentfinder.ts                      AI momen viral (hook · pacing · konteks)
     tracker.ts music.ts typography.ts    NCC tracker · komposer AI · 10 font
     render.ts exporter.ts store.ts       komposit canvas · WebCodecs muxer · state
   components/clipper/   ← UI editor (dark + merah, monospace, futuristic)
