@@ -35,7 +35,7 @@ export function StatusBar() {
       )}
       <div className="flex items-center gap-4 px-3 py-1.5 border-t border-border/60 text-[10px] text-muted-foreground bg-sidebar">
         <span className="flex items-center gap-1.5">
-          <span className="clip-led" style={{ width: 6, height: 6 }} /> CLIPPER EDITOR v1.2.6 · SIARAN LOKAL
+          <span className="clip-led" style={{ width: 6, height: 6 }} /> CLIPPER EDITOR v1.2.7 · SIARAN LOKAL
         </span>
         <span className="flex items-center gap-1.5" title="Whisper — transkripsi lokal">
           <Brain size={11} className={models.whisper === "ready" ? "text-emerald-400" : "text-muted-foreground"} />

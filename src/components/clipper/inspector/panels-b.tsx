@@ -17,6 +17,7 @@ import { FONTS } from "@/lib/clipper/typography";
 import { RESOLUTIONS, type ResolutionKey, type TextLayer } from "@/lib/clipper/types";
 import { outputDims, videoBitrate, cancelJob, newJobId } from "@/lib/clipper/exporter";
 import { enqueueExportJob, dequeueExportJob, setQueueCtx } from "@/lib/clipper/queue";
+import { getSaveMode, setSaveMode, obtainSaveDir, type SaveMode } from "@/lib/clipper/savedir";
 import { fmtTime, fmtSize, uid } from "@/lib/clipper/format";
 import { Panel, Chip, Range, TextInput, ActionBtn, Progress, Note, Row } from "../bits";
 
@@ -282,6 +283,10 @@ export function ExportPanel() {
 
   const jobs = useClipper((s) => s.jobs);
 
+  /* v1.2.7 — mode simpan: FOLDER PILIHAN (tulis langsung ke disk) / UNDUHAN */
+  const [saveMode, setSaveModeState] = useState<SaveMode>(() => getSaveMode());
+  const [dirLabel, setDirLabel] = useState<string | null>(null);
+
   /* v1.2.6 — konteks antrean global: bertahan walau panel ditutup/pindah tab,
      dan dipakai bersama panel AI MOMEN (dulu 2 jalur paralel = 2 encoding
      bersamaan = RAM meledak). */
@@ -404,6 +409,39 @@ export function ExportPanel() {
         <br />
         Setelan terkunci & tetap aktif untuk video berikutnya — Batch Ekspor & Gabung Video mengikuti resolusi ini.
       </div>
+
+      {/* v1.2.7 — SIMPAN KE: tulis langsung ke disk (tahan file besar di mesin RAM kecil) */}
+      <Row label="SIMPAN KE">
+        <Chip
+          active={saveMode === "folder"}
+          onClick={async () => {
+            setSaveMode("folder");
+            setSaveModeState("folder");
+            const dir = await obtainSaveDir(true); // paksa dialog pilih folder
+            setDirLabel(dir?.name ?? null);
+          }}
+          title="MP4 ditulis langsung ke folder pilihanmu — paling stabil untuk file besar"
+        >
+          FOLDER PILIHAN
+        </Chip>
+        <Chip
+          active={saveMode === "download"}
+          onClick={() => {
+            setSaveMode("download");
+            setSaveModeState("download");
+          }}
+          title="Cara lama: file masuk folder Unduhan browser"
+        >
+          UNDUHAN
+        </Chip>
+      </Row>
+      {saveMode === "folder" && (
+        <Note>
+          Folder: <b className="text-foreground">{dirLabel ?? "belum dipilih — dialog muncul saat ekspor pertama"}</b> · file
+          ditulis langsung ke disk selagi di-encode (tahan file ratusan MB, RAM stabil). Tetap aman: bila folder tak bisa
+          dipakai, otomatis jatuh ke UNDUHAN.
+        </Note>
+      )}
 
       <div className="grid grid-cols-2 gap-1.5">
         <ActionBtn variant="primary" disabled={!media || media.type === "audio"}

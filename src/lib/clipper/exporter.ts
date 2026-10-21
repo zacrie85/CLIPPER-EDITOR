@@ -7,7 +7,8 @@
    · GPU/CPU · BATCH EKSPOR · GABUNG VIDEO · SPLIT per bagian
    ============================================================ */
 
-import { Muxer, ArrayBufferTarget } from "mp4-muxer";
+import { Muxer, ArrayBufferTarget, FileSystemWritableFileStreamTarget } from "mp4-muxer";
+import { obtainSaveDir, resolveSaveFile, getSaveMode } from "./savedir";
 import {
   RESOLUTIONS, type ClipSettings, type ExportJob, type ExportRange,
   type ExportSettings, type MediaItem, type SpeakerSegment,
@@ -118,7 +119,9 @@ export function outputDims(settings: ExportSettings, srcW: number, srcH: number)
     // rasio mengikuti sumber; vertikal dibalik sesuai konvensi
     return { w: dims, h: evenh };
   }
-  const r = RESOLUTIONS[settings.resolution];
+  // v1.2.7 — guard: resolusi tak dikenal (mis. localStorage korup) jangan
+  // sampai TypeError merobohkan seluruh UI — jatuh ke 720p.
+  const r = RESOLUTIONS[settings.resolution] ?? RESOLUTIONS["720p"];
   const d = settings.aspect === "9:16" ? r.portrait : r.landscape;
   return { w: d.w, h: d.h };
 }
@@ -177,6 +180,25 @@ type CropKey = ReturnType<typeof buildCropKeys>[number];
 
 /* ---------- ekspor satu file ---------- */
 
+/* ============================================================
+   v1.2.7 — PENGECCEK KESEHATAN BLOB
+   Di mesin RAM kecil / setelah encoding berat, data blob bisa
+   TIDAK TERBACA (paging memori gagal) padahal size-nya benar —
+   hasil unduhan 0 byte. Baca slice kepala + ekor sebelum diunduh;
+   gagal = error JELAS (bukan file rusak diam-diam).
+   ============================================================ */
+async function assertBlobOk(blob: Blob, label: string): Promise<void> {
+  try {
+    await blob.slice(0, 64).arrayBuffer();
+    const tail = Math.max(0, blob.size - 65_536);
+    await blob.slice(tail).arrayBuffer();
+  } catch {
+    throw new Error(
+      `${label}: hasil encode tidak dapat dibaca (memori penuh) — pilih SIMPAN KE FOLDER PILIHAN di panel Ekspor (ditulis langsung ke disk), atau tutup aplikasi lain lalu ulangi.`
+    );
+  }
+}
+
 export interface ExportOneOptions {
   media: MediaItem;
   ranges: { start: number; end: number }[];
@@ -188,9 +210,13 @@ export interface ExportOneOptions {
       undefined = decode di sini (perilaku lama). Dipakai EKSPOR PARTS agar
       audio dibaca SEKALI untuk semua bagian, bukan N× decode penuh. */
   audioPre?: AudioBuffer | null;
+  /** v1.2.7 — bila diisi: MP4 DITULIS LANGSUNG KE DISK selagi di-encode
+      (File System Access API) — tanpa blob besar di memori. Return
+      exportOne menjadi null (file sudah tersimpan; tidak perlu diunduh). */
+  fileHandle?: FileSystemFileHandle | null;
 }
 
-export async function exportOne(opts: ExportOneOptions): Promise<Blob> {
+export async function exportOne(opts: ExportOneOptions): Promise<Blob | null> {
   const { media, clip, name } = opts;
   const settings = clip.export;
   const totalDur = opts.ranges.reduce((a, r) => a + (r.end - r.start), 0);
@@ -274,8 +300,21 @@ export async function exportOne(opts: ExportOneOptions): Promise<Blob> {
     }
   }
 
-  /* ----- muxer ----- */
-  const target = new ArrayBufferTarget();
+  /* ----- muxer -----
+     v1.2.7 — fileHandle → tulis langsung ke disk (StreamTarget),
+     tanpa buffer raksasa di RAM (menyembuhkan blob 0 byte di mesin
+     RAM kecil). fastStart false = moov ditulis saat finalize. */
+  let writable: FileSystemWritableFileStream | null = null;
+  let target: ArrayBufferTarget | FileSystemWritableFileStreamTarget = new ArrayBufferTarget();
+  if (opts.fileHandle) {
+    try {
+      writable = await opts.fileHandle.createWritable();
+      target = new FileSystemWritableFileStreamTarget(writable);
+    } catch {
+      writable = null; // gagal buka file → jatuh ke blob
+    }
+  }
+  if (!writable) target = new ArrayBufferTarget();
   const muxer = new Muxer({
     target,
     video: { codec: "avc", width: dims.w, height: dims.h, frameRate: fps },
@@ -288,7 +327,7 @@ export async function exportOne(opts: ExportOneOptions): Promise<Blob> {
           },
         }
       : {}),
-    fastStart: "in-memory",
+    fastStart: writable ? false : ("in-memory" as const),
   });
 
   /* ----- encoder video ----- */
@@ -465,11 +504,17 @@ export async function exportOne(opts: ExportOneOptions): Promise<Blob> {
   if (encodeErr) throw encodeErr;
 
   muxer.finalize();
-  const blob = new Blob([target.buffer], { type: "video/mp4" });
   opts.onProgress?.(1, "Selesai");
   v.removeAttribute("src");
   v.load();
   canvas.width = 0;
+  // v1.2.7 — jalur file: data sudah tertulis di disk selagi encode;
+  // close() menyelesaikan file. Tidak ada blob, tidak ada unduhan.
+  if (writable) {
+    try { await writable.close(); } catch { /* file sudah tertulis */ }
+    return null;
+  }
+  const blob = new Blob([(target as ArrayBufferTarget).buffer], { type: "video/mp4" });
   return blob;
 }
 
@@ -536,27 +581,35 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
         }
       }
       let ok = 0;
+      // v1.2.7 — folder simpanan diminta SEKALI di awal (bila mode FOLDER)
+      const useDir = getSaveMode() === "folder" ? await obtainSaveDir(false) : null;
       for (let i = 0; i < parts.length; i++) {
         if (cancelFlags.has(job.id)) throw new Error("Dibatalkan");
         const r = parts[i];
+        const partName = `${safeName(job.name)}_BAGIAN_${String(i + 1).padStart(2, "0")}.mp4`;
+        const fh = useDir ? await resolveSaveFile(partName) : null;
         const blob = await exportOne({
           media: media[0],
           ranges: [{ start: r.start, end: r.end }],
           clip: clip,
           name: `${job.name}_part${String(i + 1).padStart(2, "0")}`,
           audioPre,
+          fileHandle: fh,
           onProgress: (p, stage) =>
             update({ progress: (i + p) / parts.length * 0.99, stage: `Bagian ${i + 1}/${parts.length} — ${stage}` }),
           shouldCancel: () => cancelFlags.has(job.id),
         });
-        /* v1.2.6 — tiap bagian DIUNDUH SEGERA setelah jadi.
-           Dulu semua blob ditumpuk di RAM sampai bagian terakhir
-           (20 × ratusan MB) → renderer OOM crash di tengah proses. */
-        downloadBlob(blob, `${safeName(job.name)}_BAGIAN_${String(i + 1).padStart(2, "0")}.mp4`);
+        if (blob) {
+          /* v1.2.6 — tiap bagian DIUNDUH SEGERA setelah jadi.
+             Dulu semua blob ditumpuk di RAM sampai bagian terakhir
+             (20 × ratusan MB) → renderer OOM crash di tengah proses. */
+          await assertBlobOk(blob, `Bagian ${i + 1}`);
+          downloadBlob(blob, partName);
+        }
         ok++;
         await new Promise((res) => setTimeout(res, 600));
       }
-      update({ status: "done", progress: 1, stage: `${ok} file terunduh`, finishedAt: Date.now() });
+      update({ status: "done", progress: 1, stage: `${ok} file${useDir ? ` tersimpan di "${useDir.name}"` : " terunduh"}`, finishedAt: Date.now() });
       return;
     }
 
@@ -566,16 +619,21 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
          Kini tiap video diproses sendiri + diunduh segera. */
       let ok = 0;
       const gagal: string[] = [];
+      // v1.2.7 — folder simpanan diminta SEKALI di awal (bila mode FOLDER)
+      const useDirB = getSaveMode() === "folder" ? await obtainSaveDir(false) : null;
       for (let i = 0; i < rangesAll.length; i++) {
         if (cancelFlags.has(job.id)) throw new Error("Dibatalkan");
         const r = rangesAll[i];
         const m = media[i] ?? media[0];
         try {
+          const outName = `${safeName(m.name)}_${String(i + 1).padStart(2, "0")}.mp4`;
+          const fh = useDirB ? await resolveSaveFile(outName) : null;
           const blob = await exportOne({
             media: m,
             ranges: [{ start: r.start, end: r.end }],
             clip: { ...clip },
             name: `${job.name}_video${String(i + 1).padStart(2, "0")}`,
+            fileHandle: fh,
             onProgress: (p, stage) =>
               update({
                 progress: (i + p) / rangesAll.length * 0.99,
@@ -583,7 +641,10 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
               }),
             shouldCancel: () => cancelFlags.has(job.id),
           });
-          downloadBlob(blob, `${safeName(m.name)}_${String(i + 1).padStart(2, "0")}.mp4`);
+          if (blob) {
+            await assertBlobOk(blob, m.name.slice(0, 24));
+            downloadBlob(blob, outName);
+          }
           ok++;
           await new Promise((res) => setTimeout(res, 600));
         } catch (e) {
@@ -595,36 +656,55 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
       if (!ok) throw new Error(gagal.join(" · ") || "Semua video gagal");
       update({
         status: "done", progress: 1, finishedAt: Date.now(),
-        stage: `${ok}/${rangesAll.length} video terunduh${gagal.length ? ` · ${gagal.length} gagal` : ""}`,
+        stage: `${ok}/${rangesAll.length} video${useDirB ? ` tersimpan di "${useDirB.name}"` : " terunduh"}${gagal.length ? ` · ${gagal.length} gagal` : ""}`,
       });
       return;
     }
 
     // current / range — satu file output dari satu sumber
     if (job.target !== "merge" || media.length === 1) {
+      // v1.2.7 — SIMPAN KE FOLDER: MP4 ditulis langsung ke disk selagi
+      // encode (tanpa blob besar di RAM). Gagal pilih folder → jalur
+      // unduhan browser + pengeccek kesehatan blob (bukan 0 byte diam).
+      const outName = `${safeName(job.name)}.mp4`;
+      const fh = getSaveMode() === "folder" ? await resolveSaveFile(outName) : null;
       const blob = await exportOne({
         media: media[0],
         ranges: rangesAll.map((r) => ({ start: r.start, end: r.end })),
         clip: { ...clip },
         name: job.name,
+        fileHandle: fh,
         onProgress: (p, stage) => update({ progress: p * 0.99, stage }),
         shouldCancel: () => cancelFlags.has(job.id),
       });
-      downloadBlob(blob, `${safeName(job.name)}.mp4`);
-      update({ status: "done", progress: 1, stage: "MP4 terunduh", finishedAt: Date.now() });
+      if (blob) {
+        await assertBlobOk(blob, "Ekspor video");
+        downloadBlob(blob, outName);
+        update({ status: "done", progress: 1, stage: "MP4 terunduh", finishedAt: Date.now() });
+      } else {
+        update({ status: "done", progress: 1, stage: `MP4 tersimpan: ${outName}`, finishedAt: Date.now() });
+      }
       return;
     }
 
     // merge multi-sumber
+    const mergeName = `${safeName(job.name)}.mp4`;
+    const mergeFh = getSaveMode() === "folder" ? await resolveSaveFile(mergeName) : null;
     const blob = await exportMerge(
       media.map((m, i) => ({ media: m, ranges: [rangesAll[i]] })),
       clip,
       job.name,
       (p, stage) => update({ progress: p * 0.99, stage }),
-      () => cancelFlags.has(job.id)
+      () => cancelFlags.has(job.id),
+      mergeFh
     );
-    downloadBlob(blob, `${safeName(job.name)}.mp4`);
-    update({ status: "done", progress: 1, stage: "Gabungan MP4 terunduh", finishedAt: Date.now() });
+    if (blob) {
+      await assertBlobOk(blob, "Gabung video");
+      downloadBlob(blob, mergeName);
+      update({ status: "done", progress: 1, stage: "Gabungan MP4 terunduh", finishedAt: Date.now() });
+    } else {
+      update({ status: "done", progress: 1, stage: `Gabungan tersimpan: ${mergeName}`, finishedAt: Date.now() });
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     update({
@@ -644,12 +724,13 @@ export async function exportMerge(
   clip: ClipSettings,
   name: string,
   onProgress?: (p: number, stage: string) => void,
-  shouldCancel?: () => boolean
-): Promise<Blob> {
+  shouldCancel?: () => boolean,
+  fileHandle?: FileSystemFileHandle | null
+): Promise<Blob | null> {
   // gabung jadi satu daftar range lintas sumber; exportOne memproses berurutan
   // implementasi: render per sumber ke buffer frame → terlalu berat; gunakan
   // strategi encode berurutan dengan muxer bersama via exportMulti
-  return exportMulti(items.map((it) => ({ media: it.media, ranges: it.ranges })), clip, onProgress, shouldCancel);
+  return exportMulti(items.map((it) => ({ media: it.media, ranges: it.ranges })), clip, onProgress, shouldCancel, fileHandle);
 }
 
 /** ekspor multi-sumber ke SATU file (dipakai gabung video) */
@@ -657,8 +738,9 @@ async function exportMulti(
   sources: { media: MediaItem; ranges: { start: number; end: number }[] }[],
   clip: ClipSettings,
   onProgress?: (p: number, stage: string) => void,
-  shouldCancel?: () => boolean
-): Promise<Blob> {
+  shouldCancel?: () => boolean,
+  fileHandle?: FileSystemFileHandle | null
+): Promise<Blob | null> {
   const settings = clip.export;
   const first = sources[0].media;
   const totalDur = sources.reduce((a, s) => a + s.ranges.reduce((b, r) => b + r.end - r.start, 0), 0);
@@ -671,7 +753,18 @@ async function exportMulti(
   const frameDurUs = Math.round(1e6 / fps);
 
   const audioSetup = await pickAudioConfig(48000);
-  const target = new ArrayBufferTarget();
+  // v1.2.7 — dukung tulis langsung ke disk (sama seperti exportOne)
+  let writable: FileSystemWritableFileStream | null = null;
+  let target: ArrayBufferTarget | FileSystemWritableFileStreamTarget = new ArrayBufferTarget();
+  if (fileHandle) {
+    try {
+      writable = await fileHandle.createWritable();
+      target = new FileSystemWritableFileStreamTarget(writable);
+    } catch {
+      writable = null;
+    }
+  }
+  if (!writable) target = new ArrayBufferTarget();
   const muxer = new Muxer({
     target,
     video: { codec: "avc", width: dims.w, height: dims.h, frameRate: fps },
@@ -684,7 +777,7 @@ async function exportMulti(
           },
         }
       : {}),
-    fastStart: "in-memory",
+    fastStart: writable ? false : ("in-memory" as const),
   });
 
   let encodeErr: Error | null = null;
@@ -844,9 +937,13 @@ async function exportMulti(
   }
   if (encodeErr) throw encodeErr;
   muxer.finalize();
-  const blob = new Blob([target.buffer], { type: "video/mp4" });
   canvas.width = 0;
-  return blob;
+  // v1.2.7 — jalur file: sudah tertulis di disk; jalur blob: bungkus buffer
+  if (writable) {
+    try { await writable.close(); } catch { /* file sudah tertulis */ }
+    return null;
+  }
+  return new Blob([(target as ArrayBufferTarget).buffer], { type: "video/mp4" });
 }
 
 /* ---------- antrean utama ---------- */

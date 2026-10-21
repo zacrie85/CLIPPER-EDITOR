@@ -129,6 +129,8 @@ export interface TranscribeMeta {
   backend?: "webgpu" | "wasm";
   threads?: number;
   speechPct?: number;
+  /** v1.2.7 — mesin VAD yang dipakai: SILERO (AI) atau ENERGY (cadangan) */
+  vad?: string;
   done?: number;
   total?: number;
   elapsed?: number; // detik berjalan
@@ -274,6 +276,9 @@ export async function transcribe(
     task?: "transcribe" | "translate";
     onProgress?: (p: number, stage: string) => void;
     onMeta?: (meta: TranscribeMeta) => void;
+    /** v1.2.7 — subtitle muncul bergelembung: cue tiap region selesai
+        dikirim langsung agar user melihat teks tumbuh saat proses */
+    onPartial?: (cues: { start: number; end: number; text: string }[]) => void;
   }
 ): Promise<WhisperResult> {
   // v1.2.6 — hanya tolak bila INFERENSI worker benar-benar sedang berjalan
@@ -298,6 +303,7 @@ async function transcribeInner(
     task?: "transcribe" | "translate";
     onProgress?: (p: number, stage: string) => void;
     onMeta?: (meta: TranscribeMeta) => void;
+    onPartial?: (cues: { start: number; end: number; text: string }[]) => void;
   }
 ): Promise<WhisperResult> {
   const w = spawnWorker();
@@ -351,9 +357,18 @@ async function transcribeInner(
             backend: m.backend,
             threads: m.threads,
             ...(typeof m.speechPct === "number" ? { speechPct: m.speechPct } : {}),
+            ...(m.vad ? { vad: m.vad } : {}),
           };
           setState({ meta });
           opts.onMeta?.(meta);
+          break;
+        }
+        case "partial": {
+          // v1.2.7 — cue region terbaru, langsung ke UI (subtitle bergelembung)
+          const fresh = ((m.cues ?? []) as any[])
+            .map((c) => ({ start: Number(c.start) || 0, end: Number(c.end) || 0, text: String(c.text ?? "").trim() }))
+            .filter((c) => c.text && c.end > c.start);
+          if (fresh.length) opts.onPartial?.(fresh);
           break;
         }
         case "progress": {
@@ -361,6 +376,7 @@ async function transcribeInner(
             backend: m.backend,
             threads: m.threads,
             speechPct: m.speechPct,
+            ...(m.vad ? { vad: m.vad } : {}),
             done: m.done,
             total: m.total,
             elapsed: m.elapsed,
@@ -404,6 +420,7 @@ async function transcribeInner(
     backend: res.backend,
     threads: res.threads,
     speechPct: res.speechPct,
+    ...(res.vad ? { vad: res.vad } : {}),
   };
   setState({ running: false, p: 1, stage: "Selesai", meta });
 

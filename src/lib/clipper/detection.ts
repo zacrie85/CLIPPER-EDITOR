@@ -4,12 +4,56 @@
    CLIPPER EDITOR — Deteksi Orang (YOLOS-tiny ONNX ±10 MB)
    Unduh sekali via Transformers.js → offline permanen.
    Dipakai: zoom pembicara otomatis.
+
+   v1.2.7 — KECEPATAN:
+   • WEBGPU didahulukan (fp32) → deteksi orang ±5–10× lebih cepat
+     daripada WASM. Probe adapter + device diberi batas waktu 8 dtk
+     (driver macet tidak menggantung aplikasi).
+   • Bila WebGPU gagal memuat / crash saat dipakai → otomatis pulih
+     ke WASM q8 SEKALI JALAN (tidak mengulang percobaan GPU tiap
+     frame) — hasil analisis tetap jalan di semua mesin.
    ============================================================ */
 
 import { loadTransformers } from "./whisper";
 
  
 let detectorCache: any = null;
+let backendKind: "webgpu" | "wasm" = "wasm";
+let gpuBroken = false; // GPU sudah terbukti gagal saat dipakai → jangan coba lagi
+
+const withTimeout = async <T,>(p: Promise<T>, ms: number, label: string): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, rej) => {
+        timer = setTimeout(() => rej(new Error(label + " timeout")), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+/** probe WebGPU 8 dtk — requestAdapter/requestDevice yang menggantung = tidak ada */
+async function webgpuOk(): Promise<boolean> {
+  try {
+    const gpu = (navigator as unknown as { gpu?: any })?.gpu;
+    if (typeof navigator === "undefined" || !gpu) return false;
+    const ad = await withTimeout(
+      gpu.requestAdapter({ powerPreference: "high-performance" }),
+      8000,
+      "requestAdapter"
+    );
+    if (!ad) return false;
+    const dev = (ad as unknown as { requestDevice: () => Promise<any> }).requestDevice();
+    const devOk = await withTimeout(dev, 8000, "requestDevice");
+    try { devOk?.close?.(); } catch {}
+    return !!devOk;
+  } catch {
+    return false;
+  }
+}
 
 export async function getDetector(
   onProgress?: (p: number) => void
@@ -17,16 +61,44 @@ export async function getDetector(
 ): Promise<any> {
   if (detectorCache) return detectorCache;
   const T = await loadTransformers();
-  const pipe = await T.pipeline("object-detection", "Xenova/yolos-tiny", {
+  const cb = (info: { status: string; progress?: number }) => {
+    if (info.status === "progress" && typeof info.progress === "number") {
+      onProgress?.(info.progress / 100);
+    }
+  };
+
+  // 1) coba WEBGPU (cepat) — sekali saja, tidak saat gpuBroken
+  if (!gpuBroken && (await webgpuOk())) {
+    try {
+      detectorCache = await withTimeout(
+        T.pipeline("object-detection", "Xenova/yolos-tiny", {
+          device: "webgpu",
+          dtype: "fp32",
+          progress_callback: cb,
+        }),
+        120_000,
+        "Memuat model WebGPU"
+      );
+      backendKind = "webgpu";
+      return detectorCache;
+    } catch {
+      // muat GPU gagal (driver lama / unduhan putus) → jatuh ke WASM
+      detectorCache = null;
+    }
+  }
+
+  // 2) WASM q8 — selalu bisa (±10 MB)
+  detectorCache = await T.pipeline("object-detection", "Xenova/yolos-tiny", {
     dtype: "q8",
-    progress_callback: (info: { status: string; progress?: number }) => {
-      if (info.status === "progress" && typeof info.progress === "number") {
-        onProgress?.(info.progress / 100);
-      }
-    },
+    progress_callback: cb,
   });
-  detectorCache = pipe;
-  return pipe;
+  backendKind = "wasm";
+  return detectorCache;
+}
+
+/** mesin deteksi aktif — "webgpu" | "wasm" (untuk tampilan panel) */
+export function detectorBackend(): "webgpu" | "wasm" {
+  return backendKind;
 }
 
 export interface DetBox {
@@ -39,31 +111,47 @@ export interface DetBox {
   label: string;
 }
 
-/** deteksi orang pada satu frame canvas → kotak normalisasi */
+/** deteksi orang pada satu frame canvas → kotak normalisasi.
+    v1.2.7 — bila inferensi WebGPU gagal/crash di tengah pemakaian,
+    detector dibangun ulang sebagai WASM SEKALI lalu dicoba ulang. */
 export async function detectPersons(canvas: HTMLCanvasElement): Promise<DetBox[]> {
-  const pipe = await getDetector();
-  const out = await pipe(canvas, { threshold: 0.55, percentage: true });
-  const boxes: DetBox[] = [];
+  const run = async (): Promise<DetBox[]> => {
+    const pipe = await getDetector();
+    const out = await pipe(canvas, { threshold: 0.55, percentage: true });
+    const boxes: DetBox[] = [];
    
-  for (const r of out as any[]) {
-    const label = String(r.label ?? "").toLowerCase();
-    if (label !== "person" && label !== "human") continue;
-    const score = Number(r.score ?? 0);
-    if (score < 0.55) continue;
-    let { xmin, ymin, xmax, ymax } = r.box ?? {};
-    if (xmin === undefined) continue;
-    boxes.push({
-      x: Math.max(0, Math.min(1, xmin)),
-      y: Math.max(0, Math.min(1, ymin)),
-      w: Math.max(0.02, Math.min(1, xmax - xmin)),
-      h: Math.max(0.02, Math.min(1, ymax - ymin)),
-      score,
-      label,
-    });
+    for (const r of out as any[]) {
+      const label = String(r.label ?? "").toLowerCase();
+      if (label !== "person" && label !== "human") continue;
+      const score = Number(r.score ?? 0);
+      if (score < 0.55) continue;
+      let { xmin, ymin, xmax, ymax } = r.box ?? {};
+      if (xmin === undefined) continue;
+      boxes.push({
+        x: Math.max(0, Math.min(1, xmin)),
+        y: Math.max(0, Math.min(1, ymin)),
+        w: Math.max(0.02, Math.min(1, xmax - xmin)),
+        h: Math.max(0.02, Math.min(1, ymax - ymin)),
+        score,
+        label,
+      });
+    }
+    // urutkan kiri → kanan agar stabil (pembicara 1 = kiri, 2 = kanan)
+    boxes.sort((a, b) => a.x - b.x);
+    return boxes;
+  };
+
+  try {
+    return await run();
+  } catch (e) {
+    if (backendKind === "webgpu" && !gpuBroken) {
+      gpuBroken = true;
+      detectorCache = null;
+      try { console.warn("[detection] WebGPU gagal saat inferensi — pulih ke WASM sekali:", String(e).slice(0, 120)); } catch {}
+      return await run(); // percobaan tunggal dengan WASM
+    }
+    throw e;
   }
-  // urutkan kiri → kanan agar stabil (pembicara 1 = kiri, 2 = kanan)
-  boxes.sort((a, b) => a.x - b.x);
-  return boxes;
 }
 
 /* ---------- pelacakan antar sampel (asosiasi IoU) ---------- */

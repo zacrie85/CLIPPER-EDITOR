@@ -64,7 +64,14 @@ app.whenReady().then(async () => {
     const safe = item.getFilename().replace(/[^\w.\- ]+/g, "_");
     const target = path.join(DL_DIR, safe);
     item.setSavePath(target);
+    // v1.2.7 DIAGNOSTIK — ukuran blob saat unduhan dimulai + progres penulisan
+    console.log(`[dl-start] ${item.getFilename()} · totalBytes=${item.getTotalBytes()} · mime=${item.getMimeType()}`);
+    const probe = setInterval(() => {
+      try { console.log(`[dl-prog] ${item.getFilename()} · ${item.getReceivedBytes()}/${item.getTotalBytes()} · ${item.getState()}`); }
+      catch { clearInterval(probe); }
+    }, 1000);
     item.once("done", (_ev, state) => {
+      clearInterval(probe);
       let ok = false, size = 0;
       try {
         size = fs.statSync(target).size;
@@ -83,7 +90,10 @@ app.whenReady().then(async () => {
   win.webContents.on("console-message", (...args) => {
     const d = args[1] && typeof args[1] === "object" ? args[1] : { level: args[1], message: args[2] };
     if (d?.message && !String(d.message).includes("Security Warning")) {
-      logs.push(`[c${d.level}] ${String(d.message).slice(0, 200)}`);
+      const line = `[c${d.level}] ${String(d.message).slice(0, 200)}`;
+      logs.push(line);
+      // v1.2.7 — echo LANGSUNG agar urutan kejadian terlihat
+      console.log(line);
     }
   });
   win.webContents.on("render-process-gone", (_e, d) => console.error("[FATAL] renderer gone:", d.reason, d.exitCode));
@@ -91,11 +101,19 @@ app.whenReady().then(async () => {
   await win.loadURL("app://./index.html");
   await sleep(4000);
 
-  const click = async (label) =>
-    win.webContents.executeJavaScript(
-      `(() => { const b = [...document.querySelectorAll("button")].find(x => x.textContent.includes(${JSON.stringify(label)})); if (!b) return { ok:false, err:"tombol tidak ada: ${label}" }; if (b.disabled) return { ok:false, err:"tombol disabled: ${label}" }; b.click(); return { ok:true }; })()`,
-      true
-    );
+  const click = async (label) => {
+    // v1.2.7 — retry 5×: panel kadang belum selesai render saat klik dikirim
+    let last = { ok: false, err: "belum dicoba" };
+    for (let a = 0; a < 5; a++) {
+      last = await win.webContents.executeJavaScript(
+        `(() => { const b = [...document.querySelectorAll("button")].find(x => x.textContent.includes(${JSON.stringify(label)})); if (!b) return { ok:false, err:"tombol tidak ada: ${label}" }; if (b.disabled) return { ok:false, err:"tombol disabled: ${label}" }; b.click(); return { ok:true }; })()`,
+        true
+      );
+      if (last.ok) return last;
+      await sleep(800);
+    }
+    return last;
+  };
 
   const store = async () =>
     win.webContents.executeJavaScript(
@@ -199,7 +217,10 @@ app.whenReady().then(async () => {
 
   // resolusi 720p + 24fps agar uji cepat (setelan tersedia di UI)
   await win.webContents.executeJavaScript(
-    `window.__clipper.getState().patchExport({ resolution: "720p", fps: 24, quality: "balanced", autoMode: false })`,
+    `window.__clipper.getState().patchExport({ resolution: "720p", fps: 24, quality: "balanced", autoMode: false });
+     // v1.2.7 — uji jalur UNDUHAN (blob): folder picker tak bisa dijawab headless.
+     // Jalur FOLDER (tulis ke disk) dibuktikan terpisah oleh test-speed.js via OPFS.
+     try { localStorage.setItem("clipper-save-mode", "download"); } catch {}`,
     true
   );
 

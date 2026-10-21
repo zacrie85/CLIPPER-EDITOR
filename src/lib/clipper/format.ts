@@ -46,10 +46,15 @@ export function downloadBlob(blob: Blob, name: string) {
   a.download = name;
   document.body.appendChild(a);
   a.click();
-  setTimeout(() => {
-    URL.revokeObjectURL(a.href);
-    a.remove();
-  }, 4000);
+  a.remove();
+  /* v1.2.7 — dulu revoke 4 detik: di mesin lambat / saat CPU sibuk
+     (mis. tepat setelah beberapa encoding beruntun), Chromium belum
+     sempat MENULIS blob ke disk → unduhan "interrupted" 0 MB — file
+     ekspor rusak/0 byte PADAHAL encoding sukses (ditemukan oleh
+     regresi E2E v1.2.7: EKSPOR PARTS valid, EKSPOR VIDEO INI 0 MB).
+     Kini 90 detik — cukup untuk file besar; blob sendiri tetap di
+     memori sampai selesai ditulis. */
+  setTimeout(() => URL.revokeObjectURL(a.href), 90_000);
 }
 
 export function safeName(s: string): string {

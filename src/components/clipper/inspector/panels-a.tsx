@@ -214,13 +214,25 @@ export function SubtitlePanel() {
       whisperNote(`Menyiapkan audio ${(pcm.length / 16000).toFixed(0)} detik…`, 0.01);
       // beri satu frame agar UI sempat menggambar sebelum kerja berat worker
       await new Promise((r) => setTimeout(r, 30));
-      const res = await transcribe(pcm, { model, language: lang });
+      // v1.2.7 — SUBTITLE MUNCUL BERGELEMBUNG: cue tiap region langsung
+      // ditambahkan ke daftar subtitle saat proses berjalan (bisa dibaca
+      // lebih awal); hasil akhir tetap menimpa dengan cue resmi.
+      const live: { start: number; end: number; text: string }[] = [];
+      const res = await transcribe(pcm, {
+        model,
+        language: lang,
+        onPartial: (fresh) => {
+          live.push(...fresh);
+          patchSubtitle({ cues: [...live], mode: sub.mode === "off" ? "burnin" : sub.mode });
+        },
+      });
       patchSubtitle({ cues: res.cues, mode: sub.mode === "off" ? "burnin" : sub.mode });
       setModels({ whisper: "ready", whisperProgress: 1, whisperReady: WHISPER_MODELS[model].repo });
       const engine = res.meta.backend === "webgpu" ? "WEBGPU" : `WASM×${res.meta.threads ?? 1} CORE`;
       const pct = typeof res.meta.speechPct === "number" ? ` · ${res.meta.speechPct}% bagian bersuara` : "";
+      const vad = res.meta.vad === "SILERO" ? " · VAD AI SILERO" : "";
       setToast(
-        `Selesai — ${res.cues.length} baris${pct} · mesin ${engine}. Model tersimpan, selanjutnya 100% offline.`
+        `Selesai — ${res.cues.length} baris${pct}${vad} · mesin ${engine}. Model tersimpan, selanjutnya 100% offline.`
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -400,6 +412,11 @@ export function SpeakerPanel() {
           ? `Mode cadangan 2-bagian aktif (kiri/kanan) — AI sulit mengenali orang pada video ini (kartun/rekaman layar).`
           : `Orang terdeteksi: ${a.persons.length} · segmen fokus: ${a.segments.length} · ${a.fps.toFixed(1)} sampel/detik`
       );
+      // v1.2.7 — tampilkan mesin deteksi (GPU/CPU) di catatan panel
+      const engineNote = a.backend
+        ? ` · mesin deteksi: ${a.backend === "webgpu" ? "GPU (WEBGPU)" : "CPU"}${a.stride2 ? " · selang-seling" : ""}`
+        : "";
+      setResult((prev) => prev + engineNote);
       patchSpeaker({ enabled: true });
       setToast("Analisis selesai — pratinjau & ekspor kini mengikuti pembicara");
     } catch (e) {

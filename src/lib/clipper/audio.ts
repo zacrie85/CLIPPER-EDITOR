@@ -23,16 +23,29 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return race.finally(() => clearTimeout(t)) as Promise<T>;
 }
 
-/** decode audio 48 kHz untuk ekspor/mixing.
+/** decode audio (default: sampleRate device, mis. 48 kHz) untuk ekspor/mixing.
     v1.2.6 — dulu fetch + decodeAudioData TANPA batas waktu: bila fetch/decode
     menggantung, job ekspor diam selamanya di "Menyiapkan encoder…" tanpa pesan.
-    Kini: timeout (default 5 menit untuk file besar) + pesan jelas. */
-export async function decodeAudioFile(url: string, timeoutMs = 300_000): Promise<AudioBuffer> {
+    Kini: timeout (default 5 menit untuk file besar) + pesan jelas.
+    v1.2.7 — param sampleRate opsional: bila diisi (mis. 16000), audio langsung
+    di-decode + resample ke sample rate itu — untuk ANALISIS (envelope RMS)
+    yang tidak butuh 48 kHz → waktu & RAM jauh lebih hemat. */
+export async function decodeAudioFile(
+  url: string,
+  timeoutMs = 300_000,
+  sampleRate = 0
+): Promise<AudioBuffer> {
   const work = (async () => {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Gagal membaca media (${res.status})`);
     const arr = await res.arrayBuffer();
-    return await ctx().decodeAudioData(arr);
+    // decodeAudioData me-resample otomatis ke sample rate context-nya.
+    // OfflineAudioContext dipakai hanya sebagai decoder 16 kHz — length
+    // tidak berpengaruh pada hasil decode.
+    const ac: BaseAudioContext = sampleRate > 0
+      ? new OfflineAudioContext(2, 1, sampleRate)
+      : ctx();
+    return await ac.decodeAudioData(arr);
   })();
   try {
     return await withTimeout(work, timeoutMs, "Membaca audio video");
