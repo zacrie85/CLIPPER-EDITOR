@@ -75,7 +75,8 @@ export async function mono16k(buffer: AudioBuffer): Promise<Float32Array> {
 export async function decodeAudioFile16k(
   url: string,
   onProgress?: (mb: number, totalMb: number | null) => void,
-  isCancelled?: () => boolean
+  isCancelled?: () => boolean,
+  onStage?: (s: string) => void
 ): Promise<Float32Array> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Gagal membaca media (${res.status})`);
@@ -96,6 +97,7 @@ export async function decodeAudioFile16k(
       loaded += value.byteLength;
       onProgress?.(loaded / 1048576, total ? total / 1048576 : null);
     }
+    onStage?.("Menyatukan data audio…");
     const joined = new Uint8Array(loaded);
     let off = 0;
     for (const c of chunks) {
@@ -110,32 +112,99 @@ export async function decodeAudioFile16k(
 
   if (isCancelled?.()) throw new Error("Dibatalkan");
 
-  // --- decode LANGSUNG di 16 kHz (resample otomatis saat decode) ---
-  let ctx16: AudioContext | null = null;
-  try {
-    ctx16 = new AudioContext({ sampleRate: 16000 });
-  } catch {
-    ctx16 = null; // browser aneh → pakai jalur lama
+  /* ============================================================
+     v1.2.5 — DECODE 3 STRATEGI + TIMEOUT + HEARTBEAT
+     Laporan bug: "Membaca audio… 129/129 MB" lalu DIAM SELAMANYA.
+     Penyebab: decodeAudioData bisa MENGGANTUNG di file/mesin tertentu
+     (codec aneh, context sample-rate custom, service audio bermasalah)
+     — dan v1.2.4 tidak punya timeout, fallback, atau teks status fase
+     decode sehingga terlihat macet di 129/129 MB.
+
+     Solusi: 3 cara decode dicoba berurutan, masing-masing dengan batas
+     waktu + detak jantung di UI tiap 2 detik:
+       1. OfflineAudioContext 16 kHz — TIDAK menyentuh perangkat audio
+          (paling tahan banting; resample ke 16k langsung saat decode)
+       2. OfflineAudioContext 48 kHz — jalur offline standar
+       3. AudioContext 16 kHz — jalur device-backed (terakhir)
+     decodeAudioData melepas (detach) buffer → tiap percobaan memakai
+     salinan arr sendiri (arr.slice(0)).
+     ============================================================ */
+
+  function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const race = Promise.race([
+      p,
+      new Promise<never>((_, rej) => {
+        t = setTimeout(() => rej(new Error(`${label} melebihi ${Math.round(ms / 1000)} dtk`)), ms);
+      }),
+    ]);
+    return race.finally(() => clearTimeout(t)) as Promise<T>;
   }
 
-  let buffer: AudioBuffer;
-  try {
-    buffer = ctx16
-      ? await ctx16.decodeAudioData(arr)
-      : await new AudioContext().decodeAudioData(arr);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (/decod|encoding|unable/i.test(msg)) {
-      throw new Error(
-        "Audio di file ini tidak bisa didecode browser — biasanya video .TS / .M2TS atau codec AC3/DTS. " +
-          "Konversi dulu ke MP4/MKV/WEBM, atau impor audionya langsung sebagai MP3/WAV."
-      );
+  const strategies: { nama: string; ms: number; run: () => Promise<AudioBuffer> }[] = [
+    {
+      nama: "offline-16k",
+      ms: 150_000,
+      run: async () => {
+        const off = new OfflineAudioContext(1, 1, 16000);
+        return await off.decodeAudioData(arr.slice(0));
+      },
+    },
+    {
+      nama: "offline-48k",
+      ms: 90_000,
+      run: async () => {
+        const off = new OfflineAudioContext(1, 1, 48000);
+        return await off.decodeAudioData(arr.slice(0));
+      },
+    },
+    {
+      nama: "context-16k",
+      ms: 90_000,
+      run: async () => {
+        const c = new AudioContext({ sampleRate: 16000 });
+        try {
+          return await c.decodeAudioData(arr.slice(0));
+        } finally {
+          try { await c.close(); } catch { /* abaikan */ }
+        }
+      },
+    },
+  ];
+
+  let buffer: AudioBuffer | null = null;
+  const gagal: string[] = [];
+
+  for (let i = 0; i < strategies.length; i++) {
+    if (isCancelled?.()) throw new Error("Dibatalkan");
+    const st = strategies[i];
+    onStage?.(
+      `Men-decode audio (cara ${i + 1}/3 — ${st.nama})… video panjang bisa butuh 1–2 menit`
+    );
+    // detak jantung: UI tahu fase ini HIDUP walau decode berat
+    const t0 = Date.now();
+    const hb = setInterval(() => {
+      const dtk = Math.round((Date.now() - t0) / 1000);
+      onStage?.(`Men-decode audio… ${dtk} dtk (cara ${i + 1}/3 — ${st.nama})`);
+    }, 2000);
+    try {
+      buffer = await withTimeout(st.run(), st.ms, `decode ${st.nama}`);
+      break; // sukses
+    } catch (e) {
+      gagal.push(`${st.nama}: ${e instanceof Error ? e.message : String(e)}`);
+      // coba strategi berikutnya
+    } finally {
+      clearInterval(hb);
     }
-    throw e;
-  } finally {
-    // decodeAudioData melepas (detach) arr — tutup context agar memori bebas
-    try { await ctx16?.close(); } catch { /* abaikan */ }
-    ctx16 = null;
+  }
+
+  if (!buffer) {
+    const detail = gagal.join(" · ").slice(0, 220);
+    throw new Error(
+      "Audio di file ini tidak bisa di-decode (3 cara dicoba: " + detail + "). " +
+        "Biasanya video .TS/.M2TS atau codec AC3/DTS — konversi dulu ke MP4/WEBM, " +
+        "atau impor audionya langsung sebagai MP3/WAV."
+    );
   }
 
   if (isCancelled?.()) throw new Error("Dibatalkan");

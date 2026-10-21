@@ -198,7 +198,9 @@ export function SubtitlePanel() {
             0.006
           );
         },
-        () => cancelRef.current || whisperCancelRequested()
+        () => cancelRef.current || whisperCancelRequested(),
+        // v1.2.5 — fase decode kini TERLIHAT: "Men-decode audio… N dtk (cara 1/3)"
+        (s) => whisperNote(s)
       );
       if (cancelRef.current) throw new Error("Dibatalkan");
       whisperNote(`Menyiapkan audio ${(pcm.length / 16000).toFixed(0)} detik…`, 0.01);
