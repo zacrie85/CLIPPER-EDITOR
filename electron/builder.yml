@@ -1,0 +1,27 @@
+# Konfigurasi electron-builder — CLIPPER EDITOR untuk Windows
+appId: com.clipper.editor
+productName: CLIPPER EDITOR
+copyright: CLIPPER EDITOR
+
+directories:
+  output: release
+  buildResources: electron
+
+files:
+  - out/**/*
+  - electron/**/*
+  - package.json
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: CLIPPER-EDITOR-Setup-${version}.exe
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: CLIPPER EDITOR
