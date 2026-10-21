@@ -4,14 +4,17 @@
    CLIPPER EDITOR — Panel: SPLIT · SUBTITLE AI · ZOOM PEMBICARA
    ============================================================ */
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
-  Scissors, Captions, Users, Download, Sparkles, Play, Wand2,
+  Scissors, Captions, Users, Download, Sparkles, Play, Wand2, XCircle,
 } from "lucide-react";
 import { useClipper } from "@/lib/clipper/store";
 import { detectScenes, splitBySeconds, splitByParts } from "@/lib/clipper/scenedetect";
 import { mono16k, decodeAudioFile } from "@/lib/clipper/audio";
-import { transcribe, cuesToSRT, WHISPER_MODELS, type WhisperModel } from "@/lib/clipper/whisper";
+import {
+  transcribe, cuesToSRT, cancelWhisper, subscribeWhisper,
+  WHISPER_MODELS, type WhisperModel, type WhisperRunState,
+} from "@/lib/clipper/whisper";
 import { getCachedSpeaker } from "@/lib/clipper/exporter";
 import { downloadBlob, fmtTime } from "@/lib/clipper/format";
 import { Panel, Chip, Range, TextInput, ActionBtn, Progress, Note, Row } from "../bits";
@@ -144,50 +147,54 @@ export function SplitPanel() {
 
 /* ================= SUBTITLE AI ================= */
 
+function fmtDur(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s} dtk`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return r ? `${m} mnt ${r} dtk` : `${m} mnt`;
+}
+
 export function SubtitlePanel() {
   const media = useSelected();
   const sub = useClipper((s) => s.settings.subtitle);
   const patchSubtitle = useClipper((s) => s.patchSubtitle);
-  const setBusy = useClipper((s) => s.setBusy);
   const setToast = useClipper((s) => s.setToast);
   const models = useClipper((s) => s.models);
   const setModels = useClipper((s) => s.setModels);
   const [model, setModel] = useState<WhisperModel>("tiny");
   const [lang, setLang] = useState<"id" | "en" | "auto">("id");
-  const [progress, setProgress] = useState(0);
-  const [stage, setStage] = useState("");
   const [translating, setTranslating] = useState(false);
+  const [run, setRun] = useState<WhisperRunState>({ running: false, p: 0, stage: "", meta: {} });
+
+  /* status live dari worker — aman walau pindah tab lalu kembali */
+  useEffect(() => subscribeWhisper(setRun), []);
+
+  const running = run.running;
+  const meta = run.meta;
+  const showProg = running || (run.p > 0 && run.p < 1 && !!run.stage);
 
   const runTranscribe = async () => {
-    if (!media || media.type === "audio") return;
+    if (!media || media.type === "audio" || running) return;
     try {
-      setBusy("Menyiapkan Whisper…");
-      setProgress(0.01);
-      setStage("Mengekstrak audio 16 kHz…");
       const buf = await decodeAudioFile(media.url);
       const pcm = await mono16k(buf);
-      setStage("");
-      const res = await transcribe(pcm, {
-        model,
-        language: lang,
-        onProgress: (p, s) => {
-          setProgress(p);
-          setStage(s);
-          if (s.includes("Mengunduh")) {
-            setModels({ whisper: "downloading", whisperProgress: p });
-          }
-        },
-      });
+      const res = await transcribe(pcm, { model, language: lang });
       patchSubtitle({ cues: res.cues, mode: sub.mode === "off" ? "burnin" : sub.mode });
       setModels({ whisper: "ready", whisperProgress: 1, whisperReady: WHISPER_MODELS[model].repo });
-      setToast(`Transkripsi selesai — ${res.cues.length} baris. Unduh sekali, offline permanen.`);
+      const engine = res.meta.backend === "webgpu" ? "WEBGPU" : `WASM×${res.meta.threads ?? 1} CORE`;
+      const pct = typeof res.meta.speechPct === "number" ? ` · ${res.meta.speechPct}% bagian bersuara` : "";
+      setToast(
+        `Selesai — ${res.cues.length} baris${pct} · mesin ${engine}. Model tersimpan, selanjutnya 100% offline.`
+      );
     } catch (e) {
-      setModels({ whisper: "error" });
-      setToast(`Transkripsi gagal: ${e instanceof Error ? e.message : e}`);
-    } finally {
-      setBusy(null);
-      setProgress(0);
-      setStage("");
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/Dibatalkan/i.test(msg)) {
+        setToast("Transkripsi dibatalkan.");
+      } else {
+        setModels({ whisper: "error" });
+        setToast(`Transkripsi gagal: ${msg}`);
+      }
     }
   };
 
@@ -195,7 +202,6 @@ export function SubtitlePanel() {
     if (!sub.cues.length) return;
     try {
       setTranslating(true);
-      setBusy("Menerjemahkan subtitle (mode online)…");
       const res = await fetch("/api/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -207,10 +213,9 @@ export function SubtitlePanel() {
       patchSubtitle({ cues, showTranslated: true });
       setToast(`Diterjemahkan ke ${target === "en" ? "Inggris" : "Indonesia"}`);
     } catch (e) {
-      setToast(`Terjemahan gagal: ${e instanceof Error ? e.message : e}`);
+      setToast(`Terjemahan butuh internet: ${e instanceof Error ? e.message : e}`);
     } finally {
       setTranslating(false);
-      setBusy(null);
     }
   };
 
@@ -224,29 +229,45 @@ export function SubtitlePanel() {
     <Panel title="Subtitle AI" icon={<Captions size={12} className="text-primary" />}>
       <Row label="MODEL">
         {(Object.keys(WHISPER_MODELS) as WhisperModel[]).map((k) => (
-          <Chip key={k} active={model === k} onClick={() => setModel(k)}
+          <Chip key={k} active={model === k} disabled={running} onClick={() => setModel(k)}
             title={`${WHISPER_MODELS[k].repo} — ${WHISPER_MODELS[k].size}`}>
             {k.toUpperCase()}
           </Chip>
         ))}
       </Row>
       <Row label="BAHASA">
-        <Chip active={lang === "id"} onClick={() => setLang("id")}>INDONESIA</Chip>
-        <Chip active={lang === "en"} onClick={() => setLang("en")}>INGGRIS</Chip>
-        <Chip active={lang === "auto"} onClick={() => setLang("auto")}>AUTO</Chip>
+        <Chip active={lang === "id"} disabled={running} onClick={() => setLang("id")}>INDONESIA</Chip>
+        <Chip active={lang === "en"} disabled={running} onClick={() => setLang("en")}>INGGRIS</Chip>
+        <Chip active={lang === "auto"} disabled={running} onClick={() => setLang("auto")}>AUTO</Chip>
       </Row>
 
-      <ActionBtn variant="primary" onClick={runTranscribe} disabled={!media || media.type === "audio"} className="w-full">
-        <Sparkles size={12} className="inline mr-1" /> MULAI TRANSKRIPSI LOKAL
+      <ActionBtn variant="primary" onClick={runTranscribe} disabled={!media || media.type === "audio" || running} className="w-full">
+        <Sparkles size={12} className="inline mr-1" /> {running ? "TRANSCRIPSI BERJALAN…" : "MULAI TRANSKRIPSI LOKAL"}
       </ActionBtn>
-      {(progress > 0 || stage) && (
+      {running && (
+        <ActionBtn variant="danger" onClick={() => cancelWhisper()} className="w-full">
+          <XCircle size={12} className="inline mr-1" /> BATALKAN
+        </ActionBtn>
+      )}
+      {showProg && (
         <div className="space-y-1">
-          <Progress p={progress} />
-          <div className="text-[10px] text-muted-foreground">{stage}</div>
+          <Progress p={run.p} />
+          <div className="text-[10px] text-muted-foreground leading-relaxed">
+            {run.stage}
+            {meta.backend === "webgpu" && <span className="text-primary font-semibold"> · ⚡ WEBGPU</span>}
+            {meta.backend === "wasm" && <span> · WASM ×{meta.threads ?? 1} CORE</span>}
+            {running && typeof meta.eta === "number" && meta.eta > 0 && <span> · sisa ±{fmtDur(meta.eta)}</span>}
+            {running && typeof meta.elapsed === "number" && <span> · {fmtDur(meta.elapsed)}</span>}
+            {typeof meta.speechPct === "number" && <span> · {meta.speechPct}% bagian bersuara</span>}
+          </div>
         </div>
       )}
+      <Note>
+        ⚡ v1.2.3 — AI berjalan di worker terpisah: aplikasi tetap lancar saat transkripsi. Otomatis pakai
+        WEBGPU GPU (±10× lebih cepat), bagian senyap/musik di-skip (VAD), dan WASM kini memakai semua core CPU.
+      </Note>
       {models.whisper === "ready" && (
-        <Note>Model {models.whisperReady} tersimpan di cache browser — selanjutnya 100% offline permanen.</Note>
+        <Note>Model {models.whisperReady} tersimpan di cache — selanjutnya 100% offline permanen.</Note>
       )}
 
       {sub.cues.length > 0 && (

@@ -32,6 +32,12 @@ protocol.registerSchemesAsPrivileged([
 const isDev = !app.isPackaged;
 let win = null;
 
+// WebGPU untuk Whisper (subtitel ±10× lebih cepat) — aman: ada fallback WASM otomatis
+try {
+  app.commandLine.appendSwitch("enable-unsafe-webgpu");
+  app.commandLine.appendSwitch("enable-features", "WebGPUAllowUnsafeAPIs");
+} catch { /* abaikan */ }
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1560,
@@ -101,12 +107,16 @@ app.whenReady().then(() => {
       }
       const res = await net.fetch(pathToFileURL(file).toString());
       const mime = MIME[path.extname(file).toLowerCase()];
-      if (mime && res.ok) {
-        const headers = new Headers(res.headers);
-        headers.set("Content-Type", mime);
+      const headers = new Headers(res.headers);
+      if (mime) headers.set("Content-Type", mime);
+      // COOP/COEP → crossOriginIsolated = true → SharedArrayBuffer aktif
+      // → WASM ONNX memakai SEMUA core CPU (sebelumnya terkunci 1 thread = lambat)
+      headers.set("Cross-Origin-Opener-Policy", "same-origin");
+      headers.set("Cross-Origin-Embedder-Policy", "credentialless");
+      if (res.ok) {
         return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
       }
-      return res;
+      return new Response(res.body, { status: res.status, headers });
     } catch {
       return new Response("not found", { status: 404 });
     }

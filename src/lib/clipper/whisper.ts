@@ -10,6 +10,11 @@
    Model Whisper unduh SEKALI dari HuggingFace → Cache API browser
    → setelah itu 100% offline permanen (runtime + wasm juga lokal).
    Bila unduhan gagal → otomatis coba mirror hf-mirror.com.
+
+   v1.2.3: WHISPER pindah ke WEB WORKER (public/whisper-worker.js)
+   → UI tidak pernah beku lagi. Kecepatan: WebGPU + WASM
+   multithread + VAD (lewati bagian senyap). Loader di file ini
+   tetap dipakai modul lain (YOLOS/detection) di main thread.
    ============================================================ */
 
 let transformersMod: any = null;
@@ -108,11 +113,9 @@ export function getTransformers(): any {
 }
 
 /* ============================================================
-   WHISPER — Transkripsi lokal Bahasa Indonesia + English
-   Model: Xenova/whisper-tiny / base / small
+   WHISPER VIA WEB WORKER — Transkripsi lokal ID + EN
+   Model: whisper-tiny / base / small (WebGPU → fallback WASM)
    ============================================================ */
-
-let whisperCache: Record<string, any> = {};
 
 export type WhisperModel = "tiny" | "base" | "small";
 
@@ -122,85 +125,79 @@ export const WHISPER_MODELS: Record<WhisperModel, { repo: string; label: string;
   small: { repo: "Xenova/whisper-small", label: "SMALL — akurat", size: "±270 MB" },
 };
 
-/** cek apakah model sudah tersimpan di Cache API browser (offline-ready) */
-async function modelCached(repo: string): Promise<boolean> {
-  try {
-    const cache = await caches.open("transformers-cache");
-    const keys = await cache.keys();
-    return keys.some((r) => r.url.includes(repo));
-  } catch {
-    return false;
-  }
+export interface TranscribeMeta {
+  backend?: "webgpu" | "wasm";
+  threads?: number;
+  speechPct?: number;
+  done?: number;
+  total?: number;
+  elapsed?: number; // detik berjalan
+  eta?: number; // estimasi sisa detik
 }
 
-/** cek apakah model ikut dibundel di dalam aplikasi (/models/) */
-async function modelBundled(repo: string): Promise<boolean> {
-  try {
-    const r = await fetch(`/models/${repo}/config.json`);
-    return r.ok;
-  } catch {
-    return false;
-  }
+export interface WhisperRunState {
+  running: boolean;
+  p: number;
+  stage: string;
+  meta: TranscribeMeta;
 }
 
-const ERR_OFFLINE =
-  "Model belum tersedia offline & tidak ada koneksi internet. " +
-  "Hubungkan internet SEKALI saja untuk unduh model, setelah itu offline permanen. " +
-  "Atau pakai model TINY — sudah dibundel di dalam aplikasi, 100% offline.";
+/* ---------- status transkripsi global (bisa dilanggan UI) ---------- */
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let runState: WhisperRunState = { running: false, p: 0, stage: "", meta: {} };
+const listeners = new Set<(s: WhisperRunState) => void>();
 
-/** buat pipeline; unduhan HF gagal → ulangi maks 3× (tanpa mirror — CORS mati) */
-async function buildPipeline(
-  T: any,
-  repo: string,
-  onProgress?: (p: number) => void
-): Promise<any> {
-  const make = () =>
-    T.pipeline("automatic-speech-recognition", repo, {
-      dtype: "q8",
-      progress_callback: (info: { status: string; progress?: number; file?: string }) => {
-        if (info.status === "progress" && typeof info.progress === "number") {
-          onProgress?.(info.progress / 100);
-        }
-      },
-    });
-
-  const attempts = 3;
-  let lastErr: unknown = null;
-  for (let i = 0; i < attempts; i++) {
+function setState(patch: Partial<WhisperRunState>) {
+  runState = { ...runState, ...patch };
+  for (const l of Array.from(listeners)) {
     try {
-      return await make();
-    } catch (e) {
-      lastErr = e;
-      const offline = typeof navigator !== "undefined" && !navigator.onLine;
-      if (offline && !(await modelBundled(repo)) && !(await modelCached(repo))) {
-        throw new Error(ERR_OFFLINE);
-      }
-      if (i < attempts - 1) await sleep(1200);
+      l(runState);
+    } catch {
+      /* listener mati — abaikan */
     }
   }
-  throw new Error(
-    `Gagal memuat model (${String((lastErr as Error)?.message ?? lastErr).slice(0, 140)}). ` +
-      "Periksa koneksi internet lalu coba lagi — atau pakai model TINY (dibundel, 100% offline)."
-  );
 }
 
-export async function getWhisper(
-  model: WhisperModel,
-  onProgress?: (p: number) => void
-): Promise<any> {
-  if (whisperCache[model]) return whisperCache[model];
-  const T = await loadTransformers();
-  const repo = WHISPER_MODELS[model].repo;
-  const pipe = await buildPipeline(T, repo, onProgress);
-  whisperCache[model] = pipe;
-  return pipe;
+export function subscribeWhisper(cb: (s: WhisperRunState) => void): () => void {
+  listeners.add(cb);
+  cb(runState);
+  return () => {
+    listeners.delete(cb);
+  };
+}
+
+export function whisperRunning(): boolean {
+  return runState.running;
+}
+
+/* ---------- worker singleton ---------- */
+
+let worker: Worker | null = null;
+let activeReject: ((e: Error) => void) | null = null;
+
+function spawnWorker(): Worker {
+  if (worker) return worker;
+  // URL relatif → aman di app:// (Electron) maupun http:// (dev)
+  worker = new Worker("whisper-worker.js", { type: "module" });
+  return worker;
+}
+
+/** hentikan transkripsi sekarang juga (worker dimatikan & dibuat ulang nanti) */
+export function cancelWhisper() {
+  if (worker) {
+    worker.terminate();
+    worker = null;
+  }
+  const rej = activeReject;
+  activeReject = null;
+  if (rej) rej(new Error("Dibatalkan"));
+  setState({ running: false, p: 0, stage: "Dibatalkan" });
 }
 
 export interface WhisperResult {
   cues: { start: number; end: number; text: string }[];
   text: string;
+  meta: TranscribeMeta;
 }
 
 export async function transcribe(
@@ -210,44 +207,96 @@ export async function transcribe(
     language: "id" | "en" | "auto";
     task?: "transcribe" | "translate";
     onProgress?: (p: number, stage: string) => void;
+    onMeta?: (meta: TranscribeMeta) => void;
   }
 ): Promise<WhisperResult> {
-  const info = WHISPER_MODELS[opts.model];
-  const bundled = await modelBundled(info.repo);
-  const cached = (await modelCached(info.repo)) || bundled;
-  const pipe = await getWhisper(opts.model, (p) =>
-    opts.onProgress?.(
-      p * 0.9,
-      bundled
-        ? `Memuat model ${opts.model.toUpperCase()} dari aplikasi — 100% offline…`
-        : cached
-          ? `Memuat model ${opts.model.toUpperCase()} dari cache — offline…`
-          : `Mengunduh model ${opts.model.toUpperCase()} ${info.size} (sekali saja) — ${Math.round(p * 100)}%`
-    )
-  );
-  opts.onProgress?.(0.92, "Transkripsi berjalan — 100% lokal");
+  if (runState.running) {
+    throw new Error("Transkripsi sudah berjalan — tunggu selesai atau tekan BATAL.");
+  }
+  const w = spawnWorker();
+  setState({ running: true, p: 0.01, stage: "Menyiapkan mesin AI di worker…", meta: {} });
 
-  const language = opts.language === "auto" ? undefined : opts.language;
-  const out = await pipe(audio16k, {
-    language,
-    task: opts.task ?? "transcribe",
-    chunk_length_s: 30,
-    stride_length_s: 5,
-    return_timestamps: true,
+  const res: any = await new Promise<any>((resolve, reject) => {
+    activeReject = reject;
+    const onMsg = (ev: MessageEvent) => {
+      const m: any = ev.data;
+      if (!m || m.runId === undefined) return;
+      switch (m.type) {
+        case "stage": {
+          const p = typeof m.p === "number" ? m.p : runState.p;
+          setState({ p, stage: m.stage ?? "" });
+          opts.onProgress?.(p, m.stage ?? "");
+          break;
+        }
+        case "meta": {
+          const meta: TranscribeMeta = {
+            ...runState.meta,
+            backend: m.backend,
+            threads: m.threads,
+            ...(typeof m.speechPct === "number" ? { speechPct: m.speechPct } : {}),
+          };
+          setState({ meta });
+          opts.onMeta?.(meta);
+          break;
+        }
+        case "progress": {
+          const meta: TranscribeMeta = {
+            backend: m.backend,
+            threads: m.threads,
+            speechPct: m.speechPct,
+            done: m.done,
+            total: m.total,
+            elapsed: m.elapsed,
+            eta: m.eta,
+          };
+          const stage = `Transkripsi ${m.done}/${m.total} bagian${m.backend === "webgpu" ? " · WEBGPU" : ""}`;
+          setState({ p: m.p, stage, meta });
+          opts.onProgress?.(m.p, stage);
+          opts.onMeta?.(meta);
+          break;
+        }
+        case "done":
+          w.removeEventListener("message", onMsg);
+          activeReject = null;
+          resolve(m);
+          break;
+        case "error":
+          w.removeEventListener("message", onMsg);
+          activeReject = null;
+          reject(new Error(m.message ?? "Whisper worker error"));
+          break;
+      }
+    };
+    w.addEventListener("message", onMsg);
+    // kirim PCM (transfer — tanpa salinan, hemat memori untuk video panjang)
+    w.postMessage(
+      {
+        type: "run",
+        pcm: audio16k,
+        model: opts.model,
+        language: opts.language,
+        task: opts.task ?? "transcribe",
+      },
+      [audio16k.buffer]
+    );
   });
 
-  opts.onProgress?.(1, "Selesai");
+  const meta: TranscribeMeta = {
+    backend: res.backend,
+    threads: res.threads,
+    speechPct: res.speechPct,
+  };
+  setState({ running: false, p: 1, stage: "Selesai", meta });
 
-  const chunks: any[] = out?.chunks ?? [];
-  const cues = chunks
-    .map((c) => ({
-      start: (c.timestamp?.[0] ?? 0) as any as number,
-      end: (c.timestamp?.[1] ?? (c.timestamp?.[0] ?? 0) + 2) as any as number,
+  const cues = (res.cues ?? [])
+    .map((c: any) => ({
+      start: Number(c.start) || 0,
+      end: Number(c.end) || 0,
       text: String(c.text ?? "").trim(),
     }))
-    .filter((c) => c.text && isFinite(c.start) && isFinite(c.end));
+    .filter((c: any) => c.text && c.end > c.start);
 
-  return { cues, text: String(out?.text ?? "").trim() };
+  return { cues, text: String(res.text ?? "").trim(), meta };
 }
 
 /* ---------- SRT ---------- */
