@@ -9,9 +9,6 @@ const nextConfig: NextConfig = {
   },
   reactStrictMode: false,
   // mp4-muxer & engine client-side tidak butuh transformasi khusus
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
 };
 
 export default nextConfig;

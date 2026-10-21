@@ -1,0 +1,48 @@
+name: Build CLIPPER EDITOR (Windows .exe)
+
+# Build installer Windows otomatis + rilis ke tab Releases.
+# Jalankan manual dari tab Actions, atau otomatis saat push ke main / tag v*
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: bunx prisma generate
+
+      - name: Build aplikasi (export statik Next.js)
+        run: bun run build:electron
+
+      - name: Build installer Windows (.exe) + publish ke Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bunx electron-builder --config electron/builder.yml --publish always
+
+      - name: Upload artifact build
+        uses: actions/upload-artifact@v4
+        with:
+          name: CLIPPER-EDITOR-Windows-x64
+          path: |
+            release/*.exe
+            release/latest.yml
+          if-no-files-found: error

@@ -11,6 +11,12 @@ files:
   - out/**/*
   - electron/**/*
   - package.json
+  - "!node_modules/**/*"
+
+publish:
+  provider: github
+  owner: zacrie85
+  repo: CLIPPER-EDITOR
 
 win:
   target:
