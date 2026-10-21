@@ -32,11 +32,11 @@ protocol.registerSchemesAsPrivileged([
 const isDev = !app.isPackaged;
 let win = null;
 
-// WebGPU untuk Whisper (subtitel ±10× lebih cepat) — aman: ada fallback WASM otomatis
-try {
-  app.commandLine.appendSwitch("enable-unsafe-webgpu");
-  app.commandLine.appendSwitch("enable-features", "WebGPUAllowUnsafeAPIs");
-} catch { /* abaikan */ }
+/* v1.2.4 — dulu ada switch "enable-unsafe-webgpu" + "WebGPUAllowUnsafeAPIs".
+   Itu MEMAKSA enumerasi WebGPU di hardware/driver yang tidak didukung —
+   penyebab dugaan utama GPU process crash → jendela BLANK saat tombol
+   transkripsi ditekan. WebGPU di Chromium/Electron 44 sudah stabil & aktif
+   default di Windows; worker tetap probe dengan batas waktu + fallback WASM. */
 
 function createWindow() {
   win = new BrowserWindow({
@@ -80,6 +80,28 @@ function createWindow() {
   }
 
   win.once("ready-to-show", () => win.show());
+
+  /* v1.2.4 — PEMULIHAN CRASH: dulu renderer mati (mis. OOM decode video
+     panjang) = jendela BLANK permanen, semua menu mati — persis laporan bug.
+     Kini: renderer yang mati otomatis dimuat ulang (maks 3× per menit)
+     sehingga aplikasi pulih sendiri alih-alih blank selamanya. */
+  let reloads = [];
+  win.webContents.on("render-process-gone", (_e, details) => {
+    const now = Date.now();
+    reloads = reloads.filter((t) => now - t < 60_000);
+    console.error("[main] renderer gone:", details.reason, details.exitCode);
+    if (reloads.length >= 3) return; // cegah loop reload tak berujung
+    reloads.push(now);
+    setTimeout(() => {
+      try {
+        if (win && !win.isDestroyed()) win.webContents.reload();
+      } catch { /* abaikan */ }
+    }, 1200);
+  });
+  app.on("child-process-gone", (_e, details) => {
+    // GPU process mati dicatat — Chromium biasanya pulih sendiri
+    if (details.type === "GPU") console.error("[main] GPU process gone:", details.reason);
+  });
 }
 
 app.whenReady().then(() => {

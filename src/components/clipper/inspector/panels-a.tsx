@@ -4,15 +4,16 @@
    CLIPPER EDITOR — Panel: SPLIT · SUBTITLE AI · ZOOM PEMBICARA
    ============================================================ */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Scissors, Captions, Users, Download, Sparkles, Play, Wand2, XCircle,
 } from "lucide-react";
 import { useClipper } from "@/lib/clipper/store";
 import { detectScenes, splitBySeconds, splitByParts } from "@/lib/clipper/scenedetect";
-import { mono16k, decodeAudioFile } from "@/lib/clipper/audio";
+import { decodeAudioFile16k } from "@/lib/clipper/audio";
 import {
   transcribe, cuesToSRT, cancelWhisper, subscribeWhisper,
+  whisperNote, whisperGpu, whisperSetGpu, whisperCancelRequested, whisperReset,
   WHISPER_MODELS, type WhisperModel, type WhisperRunState,
 } from "@/lib/clipper/whisper";
 import { getCachedSpeaker } from "@/lib/clipper/exporter";
@@ -166,9 +167,12 @@ export function SubtitlePanel() {
   const [lang, setLang] = useState<"id" | "en" | "auto">("id");
   const [translating, setTranslating] = useState(false);
   const [run, setRun] = useState<WhisperRunState>({ running: false, p: 0, stage: "", meta: {} });
+  const [gpu, setGpu] = useState<"auto" | "off">("auto");
+  const cancelRef = useRef(false);
 
   /* status live dari worker — aman walau pindah tab lalu kembali */
   useEffect(() => subscribeWhisper(setRun), []);
+  useEffect(() => setGpu(whisperGpu()), []);
 
   const running = run.running;
   const meta = run.meta;
@@ -176,9 +180,30 @@ export function SubtitlePanel() {
 
   const runTranscribe = async () => {
     if (!media || media.type === "audio" || running) return;
+    cancelRef.current = false;
     try {
-      const buf = await decodeAudioFile(media.url);
-      const pcm = await mono16k(buf);
+      /* v1.2.4 — dulu fase ini SUNYI TOTAL: seluruh video di-fetch + di-decode
+         48 kHz di main thread tanpa satu pun indikator → untuk video panjang
+         RAM meledak (±2 GB) → renderer crash → LAYAR BLANK + hang.
+         Kini: progress sejak klik, decode langsung 16 kHz (±5–8× hemat RAM),
+         dan bisa dibatalkan. */
+      whisperNote("Membaca audio video…", 0.004);
+      const pcm = await decodeAudioFile16k(
+        media.url,
+        (mb, totalMb) => {
+          whisperNote(
+            totalMb
+              ? `Membaca audio… ${mb.toFixed(0)} / ${totalMb.toFixed(0)} MB`
+              : `Membaca audio… ${mb.toFixed(0)} MB`,
+            0.006
+          );
+        },
+        () => cancelRef.current || whisperCancelRequested()
+      );
+      if (cancelRef.current) throw new Error("Dibatalkan");
+      whisperNote(`Menyiapkan audio ${(pcm.length / 16000).toFixed(0)} detik…`, 0.01);
+      // beri satu frame agar UI sempat menggambar sebelum kerja berat worker
+      await new Promise((r) => setTimeout(r, 30));
       const res = await transcribe(pcm, { model, language: lang });
       patchSubtitle({ cues: res.cues, mode: sub.mode === "off" ? "burnin" : sub.mode });
       setModels({ whisper: "ready", whisperProgress: 1, whisperReady: WHISPER_MODELS[model].repo });
@@ -195,7 +220,14 @@ export function SubtitlePanel() {
         setModels({ whisper: "error" });
         setToast(`Transkripsi gagal: ${msg}`);
       }
+      // v1.2.4 — bebas error terjadi di fase mana pun, status jangan menggantung
+      whisperReset();
     }
+  };
+
+  const doCancel = () => {
+    cancelRef.current = true;
+    cancelWhisper();
   };
 
   const doTranslate = async (target: "en" | "id") => {
@@ -240,12 +272,24 @@ export function SubtitlePanel() {
         <Chip active={lang === "en"} disabled={running} onClick={() => setLang("en")}>INGGRIS</Chip>
         <Chip active={lang === "auto"} disabled={running} onClick={() => setLang("auto")}>AUTO</Chip>
       </Row>
+      <Row label="WEBGPU">
+        <Chip active={gpu === "auto"} disabled={running}
+          onClick={() => { setGpu("auto"); whisperSetGpu("auto"); }}
+          title="Coba GPU dulu (paling cepat), gagal → otomatis WASM">
+          AUTO (CEPAT)
+        </Chip>
+        <Chip active={gpu === "off"} disabled={running}
+          onClick={() => { setGpu("off"); whisperSetGpu("off"); }}
+          title="Paksa CPU-only — pilih ini bila aplikasi blank/crash saat transkripsi">
+          MATI (AMAN)
+        </Chip>
+      </Row>
 
       <ActionBtn variant="primary" onClick={runTranscribe} disabled={!media || media.type === "audio" || running} className="w-full">
         <Sparkles size={12} className="inline mr-1" /> {running ? "TRANSCRIPSI BERJALAN…" : "MULAI TRANSKRIPSI LOKAL"}
       </ActionBtn>
       {running && (
-        <ActionBtn variant="danger" onClick={() => cancelWhisper()} className="w-full">
+        <ActionBtn variant="danger" onClick={doCancel} className="w-full">
           <XCircle size={12} className="inline mr-1" /> BATALKAN
         </ActionBtn>
       )}
@@ -263,8 +307,9 @@ export function SubtitlePanel() {
         </div>
       )}
       <Note>
-        ⚡ v1.2.3 — AI berjalan di worker terpisah: aplikasi tetap lancar saat transkripsi. Otomatis pakai
-        WEBGPU GPU (±10× lebih cepat), bagian senyap/musik di-skip (VAD), dan WASM kini memakai semua core CPU.
+        ⚡ v1.2.4 — klik = langsung ada progress (membaca audio → decode 16 kHz hemat RAM →
+        transkripsi di worker terpisah). WebGPU AUTO dengan batas waktu + jatuh otomatis ke
+        WASM semua core. Bila aplikasi pernah blank: set WEBGPU ke MATI (AMAN).
       </Note>
       {models.whisper === "ready" && (
         <Note>Model {models.whisperReady} tersimpan di cache — selanjutnya 100% offline permanen.</Note>

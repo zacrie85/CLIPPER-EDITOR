@@ -170,6 +170,37 @@ export function whisperRunning(): boolean {
   return runState.running;
 }
 
+/**
+ * Tulis status PERSIAPAN (sebelum worker berjalan): "Membaca audio…",
+ * decode 16 kHz, dsb. Dipakai panel supaya klik tombol LANGSUNG
+ * menunjukkan aktifitas — dulu fase ini diam total sehingga user
+ * mengira aplikasi macet / blank.
+ */
+export function whisperNote(stage: string, p?: number) {
+  setState({ running: true, stage, p: typeof p === "number" ? p : Math.max(runState.p, 0.005) });
+}
+
+/* ---------- pengaturan WebGPU (tersimpan, default AUTO) ---------- */
+
+type GpuPref = "auto" | "off";
+const GPU_KEY = "clipper-whisper-gpu";
+
+export function whisperGpu(): GpuPref {
+  try {
+    return (localStorage.getItem(GPU_KEY) as GpuPref) || "auto";
+  } catch {
+    return "auto";
+  }
+}
+
+export function whisperSetGpu(v: GpuPref) {
+  try {
+    localStorage.setItem(GPU_KEY, v);
+  } catch {
+    /* abaikan */
+  }
+}
+
 /* ---------- worker singleton ---------- */
 
 let worker: Worker | null = null;
@@ -179,6 +210,23 @@ function spawnWorker(): Worker {
   if (worker) return worker;
   // URL relatif → aman di app:// (Electron) maupun http:// (dev)
   worker = new Worker("whisper-worker.js", { type: "module" });
+  // v1.2.4 — dulu worker gagal muat = SUNYI total (UI diam tanpa pesan).
+  // Sekarang: error worker langsung ditampilkan + promise di-reject.
+  worker.onerror = (ev) => {
+    const msg =
+      (ev as ErrorEvent)?.message ||
+      "Worker AI gagal dimuat (file aplikasi bisa jadi rusak — install ulang .exe).";
+    setState({ running: false, p: 0, stage: `Error: ${String(msg).slice(0, 140)}` });
+    const rej = activeReject;
+    activeReject = null;
+    rej?.(new Error(String(msg).slice(0, 200)));
+  };
+  worker.onmessageerror = () => {
+    setState({ running: false, p: 0, stage: "Error: pesan worker tidak bisa dibaca" });
+    const rej = activeReject;
+    activeReject = null;
+    rej?.(new Error("Pesan worker tidak bisa dibaca (serialisasi gagal)"));
+  };
   return worker;
 }
 
@@ -192,6 +240,16 @@ export function cancelWhisper() {
   activeReject = null;
   if (rej) rej(new Error("Dibatalkan"));
   setState({ running: false, p: 0, stage: "Dibatalkan" });
+}
+
+/** true setelah cancelWhisper dipanggil — untuk menghentikan persiapan audio di panel */
+export function whisperCancelRequested(): boolean {
+  return !runState.running && runState.stage === "Dibatalkan";
+}
+
+/** pulihkan status bila persiapan (decode audio) gagal — agar tombol tidak menggantung */
+export function whisperReset() {
+  setState({ running: false, p: 0, stage: "" });
 }
 
 export interface WhisperResult {
@@ -216,9 +274,39 @@ export async function transcribe(
   const w = spawnWorker();
   setState({ running: true, p: 0.01, stage: "Menyiapkan mesin AI di worker…", meta: {} });
 
+  // v1.2.4 — WATCHDOG: kalau worker diam total > 180 dtk (mis. probe WebGPU
+  // menggantung di driver GPU bermasalah / runtime gagal load), bunuh worker
+  // dan tampilkan pesan jelas — bukan UI diam selamanya.
+  let watchdog = setTimeout(() => {
+    try {
+      worker?.terminate();
+      worker = null;
+    } catch { /* abaikan */ }
+    const rej = activeReject;
+    activeReject = null;
+    setState({ running: false, p: 0, stage: "Worker AI tidak merespons — dipulihkan." });
+    rej?.(new Error("Worker AI tidak merespons (batas 3 menit). Coba lagi; bila terus terjadi, set WEBGPU ke MATI di panel Subtitle."));
+  }, 180_000);
+  const kickWatchdog = () => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => {
+      try {
+        worker?.terminate();
+        worker = null;
+      } catch { /* abaikan */ }
+      const rej = activeReject;
+      activeReject = null;
+      setState({ running: false, p: 0, stage: "Worker AI tidak merespons — dipulihkan." });
+      rej?.(new Error("Worker AI berhenti merespons. Coba lagi; bila terus terjadi, set WEBGPU ke MATI di panel Subtitle."));
+    }, 180_000);
+  };
+
+  const gpuPref = whisperGpu();
+
   const res: any = await new Promise<any>((resolve, reject) => {
     activeReject = reject;
     const onMsg = (ev: MessageEvent) => {
+      kickWatchdog();
       const m: any = ev.data;
       if (!m || m.runId === undefined) return;
       switch (m.type) {
@@ -276,10 +364,12 @@ export async function transcribe(
         model: opts.model,
         language: opts.language,
         task: opts.task ?? "transcribe",
+        gpu: gpuPref, // "auto" | "off" — off = langsung WASM (anti-crash driver GPU)
       },
       [audio16k.buffer]
     );
   });
+  clearTimeout(watchdog);
 
   const meta: TranscribeMeta = {
     backend: res.backend,

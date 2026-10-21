@@ -18,6 +18,7 @@
 let T = null;            // modul transformers.js
 let pipes = {};          // cache pipeline per key "repo|device"
 let currentRun = 0;
+let gpuPref = "auto";    // "auto" | "off" — disetel dari pesan run
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -189,10 +190,34 @@ class IdbCache {
 const AI_CACHE = new IdbCache();
 
 async function webgpuAvailable() {
+  // v1.2.4 — dulu requestAdapter bisa MENGGANTUNG SELAMANYA di driver GPU
+  // Windows bermasalah (UI diam total). Sekarang: probe dengan batas waktu
+  // 10 dtk + coba requestDevice — gagal/gantung = anggap tidak ada WebGPU.
+  const withTimeout = async (p, ms, label) => {
+    let timer = null;
+    try {
+      return await Promise.race([
+        p,
+        new Promise((_, rej) => {
+          timer = setTimeout(() => rej(new Error(label + " timeout")), ms);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   try {
     if (typeof navigator === "undefined" || !navigator.gpu) return false;
-    const ad = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    return !!ad;
+    const ad = await withTimeout(
+      navigator.gpu.requestAdapter({ powerPreference: "high-performance" }),
+      10_000,
+      "requestAdapter"
+    );
+    if (!ad) return false;
+    // cek device benar-benar bisa dibuat (driver macet terdeteksi di sini)
+    const dev = await withTimeout(ad.requestDevice(), 10_000, "requestDevice");
+    try { dev?.close?.(); } catch {}
+    return !!dev;
   } catch {
     return false;
   }
@@ -207,7 +232,8 @@ async function buildPipe(modelKey, onModelProgress, forceWasm = false) {
     }
   };
 
-  const gpu = forceWasm ? false : await webgpuAvailable();
+  // v1.2.4 — gpuPref dari panel: "off" = user melarang WebGPU (WASM langsung)
+  const gpu = forceWasm || gpuPref === "off" ? false : await webgpuAvailable();
   const gpuCached = gpu ? await cachedInBrowser("onnx-community/whisper-" + modelKey) : false;
   const online = typeof navigator !== "undefined" ? navigator.onLine : true;
 
@@ -369,7 +395,8 @@ self.onmessage = async (ev) => {
   const msg = ev.data;
   if (msg?.type !== "run") return;
   const runId = ++currentRun;
-  const { pcm, model, language, task } = msg;
+  const { pcm, model, language, task, gpu } = msg;
+  if (gpu === "off" || gpu === "auto" || gpu === "on") gpuPref = gpu;
   const send = (m) => {
     if (runId === currentRun) self.postMessage({ ...m, runId });
   };
@@ -431,6 +458,7 @@ self.onmessage = async (ev) => {
     const loadFrac = 0.16;
     const tStart = performance.now();
     let lastPing = 0;
+    let lastKnownFrac = loadFrac;
 
     for (let i = 0; i < total; i++) {
       if (runId !== currentRun) return;
@@ -454,7 +482,18 @@ self.onmessage = async (ev) => {
         opts.stride_length_s = 5;
       }
 
-      const out = await pipe(sub, opts);
+      // v1.2.4 — ping tiap 5 dtk selama satu region dikerjakan: watchdog di
+      // sisi UI tetap hidup & user melihat aktifitas walau region panjang sunyi
+      const ping = setInterval(() => {
+        send({ type: "stage", stage: `Menulis teks bagian ${i + 1}/${total}…`, p: lastKnownFrac, ...meta });
+      }, 5000);
+
+      let out;
+      try {
+        out = await pipe(sub, opts);
+      } finally {
+        clearInterval(ping);
+      }
       if (runId !== currentRun) return;
 
       cues.push(...cleanCues(out?.chunks, r.start));
@@ -465,6 +504,7 @@ self.onmessage = async (ev) => {
       if (now - lastPing > 200 || done === total) {
         lastPing = now;
         const frac = loadFrac + (done / total) * (1 - loadFrac - 0.01);
+        lastKnownFrac = frac;
         const elapsed = (now - tStart) / 1000;
         const eta = done > 0 ? (elapsed / done) * (total - done) : 0;
         send({
