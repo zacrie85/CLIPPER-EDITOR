@@ -20,7 +20,7 @@ Semua decoding, analisis AI, dan encoding terjadi di device lo sendiri.
 |---|-------|--------|
 | 1 | **Impor media** | MP4 · MKV · TS · WEBM · MP3 — decode via **WebCodecs API** |
 | 2 | **Auto split** | Potong per detik atau multi-segmen (Canvas + WebCodecs) |
-| 3 | **AI Subtitle** | Whisper (Transformers.js/WASM) **ID + EN** → transkrip + SRT + gaya karaoke; unduh sekali, **offline permanen** |
+| 3 | **AI Subtitle** | Whisper (WASM) **ID + EN** → transkrip + SRT + gaya karaoke; **model TINY dibundel di aplikasi → jalan offline sejak install pertama tanpa unduhan**; BASE/SMALL unduh sekali lalu offline permanen |
 | 4 | **Object Tracking** | Label grafis gaya MotoGP — tracker **NCC pyramidal** (coarse-to-fine) |
 | 5 | **AI Musik** | Komposer prosedural (EPIC · LO-FI · dsb.) via Web Audio API + impor MP3 sendiri |
 | 6 | **Tipografi sinematik** | 10 font (Cinzel, Anton, dsb.) · 5 gaya · animasi masuk/keluar |
@@ -32,6 +32,7 @@ Semua decoding, analisis AI, dan encoding terjadi di device lo sendiri.
 
 ## 🛠️ Catatan versi & pemecahan masalah
 
+- **v1.2.2 — FIX SUBTITLE AI**: (1) runtime Transformers.js + WASM ONNX kini **dibundel di dalam aplikasi** — tidak ada lagi unduhan runtime dari CDN; (2) **model Whisper TINY (42 MB) dibundel** — subtitle jalan 100% offline sejak install pertama; BASE/SMALL tetap via unduhan sekali dari HuggingFace dengan retry otomatis 3×; (3) pesan error ramah untuk video .TS/AC3 yang audionya tak bisa didecode browser; (4) progres unduhan tampil persen per model.
 - **v1.2.1 — FIX LAYAR HITAM**: aplikasi Windows versi lama bisa tampil layar hitam saat dibuka (path asset absolut `/\_next/…` rusak di protokol `file://`). Sekarang dimuat via protokol kustom `app://` + path asset relatif — sudah diuji headless (JS terhidrasi + CSS termuat). **Wajib update ke 1.2.1.**
 - Installer **unsigned** → SmartScreen warning: klik **More info → Run anyway**.
 - Kalau unduhan model AI pertama terputus: jalankan app sekali lagi, unduhan lanjut dari cache.

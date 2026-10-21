@@ -26,13 +26,26 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 app.whenReady().then(async () => {
-  protocol.handle("app", (request) => {
+  const MIME = {
+    ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript",
+    ".css": "text/css", ".json": "application/json", ".map": "application/json",
+    ".wasm": "application/wasm", ".svg": "image/svg+xml", ".png": "image/png",
+    ".ico": "image/x-icon", ".txt": "text/plain",
+  };
+  protocol.handle("app", async (request) => {
     try {
       let p = decodeURIComponent(new URL(request.url).pathname);
       if (p === "/" || p === "") p = "/index.html";
       const file = path.normalize(path.join(OUT_DIR, p));
       if (!file.startsWith(OUT_DIR)) return new Response("forbidden", { status: 403 });
-      return net.fetch(pathToFileURL(file).toString());
+      const res = await net.fetch(pathToFileURL(file).toString());
+      const mime = MIME[path.extname(file).toLowerCase()];
+      if (mime && res.ok) {
+        const headers = new Headers(res.headers);
+        headers.set("Content-Type", mime);
+        return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+      }
+      return res;
     } catch {
       return new Response("not found", { status: 404 });
     }

@@ -77,9 +77,20 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  // MIME wajib eksplisit — net.fetch(file://) tidak mengenali .mjs/.wasm,
+  // padahal modul ES butuh text/javascript & WASM butuh application/wasm
+  const MIME = {
+    ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript",
+    ".css": "text/css", ".json": "application/json", ".map": "application/json",
+    ".wasm": "application/wasm", ".svg": "image/svg+xml", ".png": "image/png",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+    ".ico": "image/x-icon", ".txt": "text/plain", ".xml": "application/xml",
+    ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf", ".otf": "font/otf",
+  };
+
   // handler app:// — layani file dari out/; path absolut /\_next/… resolve
   // ke app://./\_next/… karena scheme diberi privileges "standard"
-  protocol.handle("app", (request) => {
+  protocol.handle("app", async (request) => {
     try {
       let p = decodeURIComponent(new URL(request.url).pathname);
       if (p === "/" || p === "") p = "/index.html";
@@ -88,7 +99,14 @@ app.whenReady().then(() => {
       if (!file.startsWith(OUT_DIR)) {
         return new Response("forbidden", { status: 403 });
       }
-      return net.fetch(pathToFileURL(file).toString());
+      const res = await net.fetch(pathToFileURL(file).toString());
+      const mime = MIME[path.extname(file).toLowerCase()];
+      if (mime && res.ok) {
+        const headers = new Headers(res.headers);
+        headers.set("Content-Type", mime);
+        return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+      }
+      return res;
     } catch {
       return new Response("not found", { status: 404 });
     }

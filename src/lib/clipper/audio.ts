@@ -15,7 +15,18 @@ function ctx(): AudioContext {
 export async function decodeAudioFile(url: string): Promise<AudioBuffer> {
   const res = await fetch(url);
   const arr = await res.arrayBuffer();
-  return await ctx().decodeAudioData(arr);
+  try {
+    return await ctx().decodeAudioData(arr);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/decod|encoding|unable/i.test(msg)) {
+      throw new Error(
+        "Audio di file ini tidak bisa didecode browser — biasanya video .TS / .M2TS atau codec AC3/DTS. " +
+          "Konversi dulu ke MP4/MKV/WEBM, atau impor audionya langsung sebagai MP3/WAV."
+      );
+    }
+    throw e;
+  }
 }
 
 /** gabungkan channel → mono, resample ke 16kHz → Float32Array (format Whisper) */
