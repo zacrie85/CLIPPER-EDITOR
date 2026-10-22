@@ -74,3 +74,4 @@ verify-*.png
 /release/
 upload/
 scripts/testmedia/
+tool-results/
