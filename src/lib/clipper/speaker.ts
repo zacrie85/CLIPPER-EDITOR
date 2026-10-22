@@ -17,10 +17,21 @@
       analisis tetap sama.
    3. AUDIO 16 kHz — analisis gelombang kini decode 16 kHz
       (dulu 48 kHz penuh) → waktu & RAM −60%, hasil RMS sama.
+
+   v1.2.8 — DUA PERCEPATAN LAGI (2–3× total):
+   4. PIPELINE OVERLAP — ambil frame BERIKUTNYA (seek video) berjalan
+      BERSAMAAN dengan inferensi AI frame sekarang. Dulu semuanya
+      berurutan: seek → tunggu → AI → tunggu → seek… Kini tumpang
+      tindih seek + AI (canvas cincin 3 slot, RAM konstan ±1 MB —
+      dulu SEMUA frame disimpan dulu: video 30 menit ≈ 800 MB RAM!).
+   5. LANGKAH ADAPTIF — video pendek tetap 0,5 dtk/sampel; video
+      panjang 1–1,5 dtk (pembicara jarang ganti di bawah 1 dtk,
+      tahan-minimum sudah 1 dtk) → video 1 jam maksimum ±2.400
+      sampel, dulu 7.200.
    ============================================================ */
 
 import type { SpeakerConfig, SpeakerSegment } from "./types";
-import { sampleFrames, regionDiff } from "./frames";
+import { regionDiff, openVideo, grabFrame, makeCanvas } from "./frames";
 import { detectPersons, detectorBackend, PersonTracker, type DetBox } from "./detection";
 import { stereoEnvelope, decodeAudioFile, type EnvelopePoint } from "./audio";
 import { clamp } from "./format";
@@ -45,68 +56,114 @@ export async function analyzeSpeaker(
   cfg: SpeakerConfig,
   onProgress?: (p: number, stage: string) => void
 ): Promise<SpeakerAnalysis> {
-  const step = 0.5; // analisis 2x per detik
-  const n = Math.max(2, Math.floor(duration / step));
+  /* v1.2.8 — langkah adaptif: pendek 0,5 dtk · sedang 1,0 dtk · panjang 1,5 dtk
+     (batas total 2.400 sampel — video 1 jam pun selesai cepat) */
+  const baseStep = duration <= 300 ? 0.5 : duration <= 1200 ? 1.0 : 1.5;
+  let n = Math.max(2, Math.floor(duration / baseStep));
+  if (n > 2400) n = 2400;
+  const step = duration / n; // pas kembali agar sampel menutup seluruh durasi
   const times: number[] = [];
   for (let i = 0; i < n; i++) times.push(i * step);
 
-  onProgress?.(0.02, "Mengambil frame sampel…");
-  const frames = await sampleFrames(url, times, ANALYSIS_W, ANALYSIS_H, (p) =>
-    onProgress?.(0.02 + p * 0.18, "Mengambil frame sampel…")
-  );
+  const W = ANALYSIS_W;
+  const H = ANALYSIS_H;
 
-  /* ---- Sinyal 1: deteksi orang + Sinyal 2: gerakan kepala/mulut ----
-     v1.2.7 — STRIDE 2: AI dipanggil tiap frame genap; frame ganjil
-     memakai kotak orang terakhir (orang nyaris tak berpindah dalam
-     0,5 dtk) → inferensi −50%. Tracking & motion tetap jalan tiap frame. */
   const tracker = new PersonTracker();
   const perFrameIds: number[][] = [];
   const headMotion: Record<number, number[]> = {};
   let lastBoxes: DetBox[] = [];
   const detectEvery = 2;
   let detectCalls = 0;
+  const totalDetect = Math.ceil(times.length / detectEvery);
 
-  for (let i = 0; i < frames.length; i++) {
-    const f = frames[i];
-    const ctx = f.getContext("2d", { willReadFrequently: true })!;
-    let boxes: DetBox[] = [];
-    try {
-      if (cfg.useFace && (i % detectEvery === 0 || lastBoxes.length === 0)) {
-        boxes = await detectPersons(f);
-        lastBoxes = boxes;
-        detectCalls++;
-        onProgress?.(
-          0.2 + (i / frames.length) * 0.5,
-          `AI mendeteksi orang… (${detectCalls}/${Math.ceil(frames.length / detectEvery)})`
-        );
-      } else if (cfg.useFace) {
-        boxes = lastBoxes; // posisi terakhir — hemat inferensi
+  onProgress?.(0.02, cfg.useFace ? "Mengambil frame sampel…" : "Menganalisis gelombang suara…");
+
+  /* ----------------------------------------------------------
+     v1.2.8 — PIPELINE OVERLAP (ring 3 canvas)
+     iterasi i: [mulai seek frame i] → [tunggu AI frame i-1]
+     → [gerakan kepala i-1] → [terima frame i]
+     Seek video & inferensi AI kini TUMPANG TINDIH, dan RAM tetap
+     kecil: hanya 3 canvas yang diulang-alih (dulu SEMUA frame
+     sampel ditumpuk di memori dulu). */
+  if (cfg.useFace) {
+    const canvases = [makeCanvas(W, H), makeCanvas(W, H), makeCanvas(W, H)];
+    const ctxOf = (c: HTMLCanvasElement) =>
+      c.getContext("2d", { willReadFrequently: true })!;
+    const v = await openVideo(url, 30000);
+
+    /** proses satu frame yang kotaknya sudah diketahui */
+    const process = (i: number, boxes: DetBox[]) => {
+      const ids = tracker.update(boxes);
+      perFrameIds[i] = ids;
+      // gerakan area kepala per trek (bandingkan dengan frame sampel sebelumnya)
+      if (i > 0 && boxes.length) {
+        const cur = ctxOf(canvases[i % 3]);
+        const prev = ctxOf(canvases[(i - 1) % 3]);
+        ids.forEach((id, bi) => {
+          const b = boxes[bi];
+          const x = Math.floor(clamp(b.x + b.w * 0.2, 0, 1) * W);
+          const y = Math.floor(clamp(b.y + b.h * 0.08, 0, 1) * H);
+          const w = Math.max(4, Math.floor(b.w * 0.6 * W));
+          const h = Math.max(4, Math.floor(b.h * 0.3 * H));
+          try {
+            const d = regionDiff(prev, cur, x, y, Math.min(w, W - x), Math.min(h, H - y));
+            (headMotion[id] ??= []).push(d);
+          } catch {
+            (headMotion[id] ??= []).push(0);
+          }
+        });
       }
-    } catch {
-      boxes = [];
-    }
-    const ids = tracker.update(boxes);
-    perFrameIds.push(ids);
+    };
 
-    // gerakan area kepala per trek (bandingkan dengan frame sampel sebelumnya)
-    if (i > 0 && boxes.length) {
-      const prev = frames[i - 1].getContext("2d", { willReadFrequently: true })!;
-      ids.forEach((id, bi) => {
-        const b = boxes[bi];
-        // area kepala = 35% atas kotak orang
-        const x = Math.floor(clamp(b.x + b.w * 0.2, 0, 1) * ANALYSIS_W);
-        const y = Math.floor(clamp(b.y + b.h * 0.08, 0, 1) * ANALYSIS_H);
-        const w = Math.max(4, Math.floor(b.w * 0.6 * ANALYSIS_W));
-        const h = Math.max(4, Math.floor(b.h * 0.3 * ANALYSIS_H));
-        try {
-          const d = regionDiff(prev, ctx, x, y, Math.min(w, ANALYSIS_W - x), Math.min(h, ANALYSIS_H - y));
-          (headMotion[id] ??= []).push(d);
-        } catch {
-          (headMotion[id] ??= []).push(0);
+    let pending: number | null = null; // indeks frame yang AI-nya sedang berjalan
+    try {
+      for (let i = 0; i < times.length; i++) {
+        const grabP = grabFrame(v, times[i], W, H, canvases[i % 3]);
+        // sementara frame i di-seek, AI mendeteksi frame i-1 (BERSAMAAN)
+        if (pending !== null) {
+          let boxes: DetBox[] = [];
+          try {
+            boxes = await detectPersons(canvases[pending % 3]);
+            lastBoxes = boxes;
+            detectCalls++;
+            onProgress?.(
+              0.2 + ((i - 1) / times.length) * 0.5,
+              `AI mendeteksi orang… (${detectCalls}/${totalDetect})`
+            );
+          } catch {
+            boxes = [];
+          }
+          process(pending, boxes);
+          pending = null;
         }
-      });
+        await grabP;
+        if (i % detectEvery === 0) {
+          pending = i; // frame genap → dikirim ke AI (diproses di iterasi berikutnya)
+        } else {
+          process(i, lastBoxes); // frame ganjil → posisi orang terakhir
+        }
+      }
+      // ekor: frame terakhir genap masih menunggu AI
+      if (pending !== null) {
+        let boxes: DetBox[] = [];
+        try {
+          boxes = await detectPersons(canvases[pending % 3]);
+          lastBoxes = boxes;
+          detectCalls++;
+        } catch {
+          boxes = [];
+        }
+        process(pending, boxes);
+        pending = null;
+      }
+    } finally {
+      v.removeAttribute("src");
+      v.load();
+      canvases.forEach((c) => (c.width = 0));
     }
-    void ctx;
+  } else {
+    // tanpa AI orang → analisis audio saja (mode 2-bagian), tanpa buka video
+    for (let i = 0; i < times.length; i++) perFrameIds.push([]);
   }
 
   const persons = tracker.tracks.map((t) => ({ id: t.id, box: t.box, samples: t.samples }));
@@ -249,7 +306,6 @@ export async function analyzeSpeaker(
   merged.forEach((s, i) => (s.t1 = merged[i + 1]?.t0 ?? duration));
 
   onProgress?.(1, "Analisis pembicara selesai");
-  frames.forEach((f) => (f.width = 0));
 
   return {
     segments: merged,
@@ -257,7 +313,7 @@ export async function analyzeSpeaker(
     fallback,
     fps: 1 / step,
     backend: detectorBackend(),
-    stride2: detectCalls < frames.length,
+    stride2: detectCalls < times.length,
   };
 }
 

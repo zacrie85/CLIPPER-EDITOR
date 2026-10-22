@@ -14,6 +14,7 @@ import { decodeAudioFile16k } from "@/lib/clipper/audio";
 import {
   transcribe, cuesToSRT, cancelWhisper, subscribeWhisper,
   whisperNote, whisperGpu, whisperSetGpu, whisperCancelRequested, whisperReset,
+  saveSubPrefs, subPersistedModel, subPersistedLang,
   WHISPER_MODELS, type WhisperModel, type WhisperRunState,
 } from "@/lib/clipper/whisper";
 import { getCachedSpeaker } from "@/lib/clipper/exporter";
@@ -47,12 +48,13 @@ export function SplitPanel() {
       setProgress(0.02);
       let cuts: number[] = [];
       if (split.mode === "scene") {
+        // v1.2.8 — sampling adaptif otomatis per durasi (0) + refine batas + cache
         const res = await detectScenes(
           media.url,
           media.duration,
           split.sensitivity,
           split.minScene,
-          4,
+          0,
           (p) => setProgress(p)
         );
         cuts = res.cuts;
@@ -119,6 +121,10 @@ export function SplitPanel() {
         <Wand2 size={12} className="inline mr-1" /> JALANKAN SPLIT OTOMATIS
       </ActionBtn>
       {progress > 0 && <Progress p={progress} />}
+      <Note>
+        ⚡ v1.2.8 — cukup pilih mode di sini. Kalau mau <b className="text-foreground">AI yang bekerja saat ekspor</b>
+        (AI MOMEN / SUBTITLE / PEMBICARA otomatis), centang di panel <b className="text-foreground">EKSPOR → OTOMATIS CERDAS</b>.
+      </Note>
 
       {parts.length > 0 && (
         <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
@@ -171,8 +177,8 @@ export function SubtitlePanel() {
   const setToast = useClipper((s) => s.setToast);
   const models = useClipper((s) => s.models);
   const setModels = useClipper((s) => s.setModels);
-  const [model, setModel] = useState<WhisperModel>("tiny");
-  const [lang, setLang] = useState<"id" | "en" | "auto">("id");
+  const [model, setModel] = useState<WhisperModel>(() => subPersistedModel());
+  const [lang, setLang] = useState<"id" | "en" | "auto">(() => subPersistedLang());
   const [translating, setTranslating] = useState(false);
   const [run, setRun] = useState<WhisperRunState>({ running: false, p: 0, stage: "", meta: {} });
   const [gpu, setGpu] = useState<"auto" | "off">("auto");
@@ -189,6 +195,8 @@ export function SubtitlePanel() {
   const runTranscribe = async () => {
     if (!media || media.type === "audio" || running) return;
     cancelRef.current = false;
+    // v1.2.8 — ingat pilihan: OTOMATIS CERDAS memakai model & bahasa yang sama
+    saveSubPrefs(model, lang);
     try {
       /* v1.2.4 — dulu fase ini SUNYI TOTAL: seluruh video di-fetch + di-decode
          48 kHz di main thread tanpa satu pun indikator → untuk video panjang

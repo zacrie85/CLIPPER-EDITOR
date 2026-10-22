@@ -4,10 +4,10 @@
    CLIPPER EDITOR — Panel: MUSIK AI · TEKS · TRACKER · EKSPOR
    ============================================================ */
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Music, Type, Target, Package, Upload, Play, Crosshair, Trash2,
-  Download, Layers, Merge, Boxes, X,
+  Download, Layers, Merge, Boxes, X, Flame, Captions, Users,
 } from "lucide-react";
 import { useClipper } from "@/lib/clipper/store";
 import { MUSIC_PRESETS, composeMusic } from "@/lib/clipper/music";
@@ -271,6 +271,20 @@ export function TrackerPanel() {
 
 /* ================= EKSPOR ================= */
 
+/* v1.2.8 — centangan OTOMATIS CERDAS tersimpan antar sesi */
+const AUTO_KEY = "clipper-auto-flags";
+type AutoFlags = { moment: boolean; subtitle: boolean; speaker: boolean };
+function loadAutoFlags(): AutoFlags {
+  try {
+    const raw = localStorage.getItem(AUTO_KEY);
+    if (raw) {
+      const p = JSON.parse(raw);
+      return { moment: !!p.moment, subtitle: !!p.subtitle, speaker: !!p.speaker };
+    }
+  } catch { /* abaikan */ }
+  return { moment: false, subtitle: false, speaker: false };
+}
+
 export function ExportPanel() {
   const media = useSelected();
   const clip = useClipper((s) => s.settings);
@@ -286,6 +300,13 @@ export function ExportPanel() {
   /* v1.2.7 — mode simpan: FOLDER PILIHAN (tulis langsung ke disk) / UNDUHAN */
   const [saveMode, setSaveModeState] = useState<SaveMode>(() => getSaveMode());
   const [dirLabel, setDirLabel] = useState<string | null>(null);
+
+  /* v1.2.8 — OTOMATIS CERDAS: centang AI yang dijalankan saat ekspor */
+  const [auto, setAuto] = useState<AutoFlags>(() => loadAutoFlags());
+  useEffect(() => {
+    try { localStorage.setItem(AUTO_KEY, JSON.stringify(auto)); } catch { /* abaikan */ }
+  }, [auto]);
+  const anyAuto = auto.moment || auto.subtitle || auto.speaker;
 
   /* v1.2.6 — konteks antrean global: bertahan walau panel ditutup/pindah tab,
      dan dipakai bersama panel AI MOMEN (dulu 2 jalur paralel = 2 encoding
@@ -327,10 +348,26 @@ export function ExportPanel() {
     target: "current" | "split" | "batch" | "merge",
     ranges: { mediaId: string; start: number; end: number }[]
   ) => {
+    /* v1.2.8 — bila AI MOMEN dicentang: pembagian momen MENGANTIKAN
+       rentang biasa. Ekspor Video Ini berubah menjadi "tiap momen satu
+       file" (target split) — sama seperti tombol EKSPOR SEMUA di panel
+       AI Momen, tapi tanpa perlu analisis manual dulu. */
+    let effTarget = target;
+    let effRanges = ranges;
+    if (auto.moment && target === "current" && media) {
+      effTarget = "split";
+      effRanges = [{ mediaId: media.id, start: 0, end: media.duration }];
+    }
     const job = {
-      id: newJobId(), name, target, ranges,
+      id: newJobId(),
+      name,
+      target: effTarget,
+      ranges: effRanges,
       settings: { ...clip.export },
-      status: "queued" as const, progress: 0, stage: "Menunggu antrean…",
+      status: "queued" as const,
+      progress: 0,
+      stage: anyAuto ? "Antre — AI otomatis akan berjalan dulu…" : "Menunggu antrean…",
+      auto: anyAuto ? { subtitle: auto.subtitle, moment: auto.moment, speaker: auto.speaker } : undefined,
     };
     addJob(job);
     // v1.2.6 — antrean serial GLOBAL (satu job berjalan kapan pun,
@@ -442,6 +479,49 @@ export function ExportPanel() {
           dipakai, otomatis jatuh ke UNDUHAN.
         </Note>
       )}
+
+      {/* ============ v1.2.8 — OTOMATIS CERDAS ============ */}
+      <div className="border border-primary/40 rounded p-2 space-y-2 bg-primary/5">
+        <div className="flex items-center justify-between gap-2">
+          <span className="clip-label text-primary">OTOMATIS CERDAS — CENTANG SAAT EKSPOR</span>
+        </div>
+        <div className="grid grid-cols-3 gap-1.5">
+          <Chip
+            active={auto.moment}
+            onClick={() => setAuto((a) => ({ ...a, moment: !a.moment }))}
+            title="AI cari momen viral (hook/pacing/konteks) → tiap momen jadi file sendiri. Tidak perlu analisis manual dulu."
+          >
+            <Flame size={11} className="inline mr-1" /> AI MOMEN
+          </Chip>
+          <Chip
+            active={auto.subtitle}
+            onClick={() => setAuto((a) => ({ ...a, subtitle: !a.subtitle }))}
+            title="Transkripsi Whisper otomatis bila video belum punya subtitle → teks dibakar ke hasil ekspor"
+          >
+            <Captions size={11} className="inline mr-1" /> SUBTITLE
+          </Chip>
+          <Chip
+            active={auto.speaker}
+            onClick={() => setAuto((a) => ({ ...a, speaker: !a.speaker }))}
+            title="Zoom mengikuti orang yang sedang bicara — analisis berjalan otomatis saat ekspor"
+          >
+            <Users size={11} className="inline mr-1" /> PEMBICARA
+          </Chip>
+        </div>
+        <div className="text-[10px] text-muted-foreground leading-relaxed">
+          {anyAuto ? (
+            <>
+              <b className="text-foreground">Saat tombol ekspor ditekan, aplikasi berjalan sendiri:</b>{" "}
+              {auto.subtitle && <>① SUBTITLE AI (transkripsi offline) </>}
+              {auto.moment && <>② AI MOMEN (video dibagi ke momen terbaik — bagian split diabaikan) </>}
+              {auto.speaker && <>③ PEMBICARA (kamera zoom otomatis) </>}
+              ④ ENCODE MP4. Hasil analisis tersimpan — panel AI Momen &amp; Subtitle menampilkan yang sama.
+            </>
+          ) : (
+            <>Belum ada yang dicentang — ekspor murni encode. Centang di atas untuk AI otomatis: tiap momen jadi file / subtitle terbakar / kamera ikut pembicara.</>
+          )}
+        </div>
+      </div>
 
       <div className="grid grid-cols-2 gap-1.5">
         <ActionBtn variant="primary" disabled={!media || media.type === "audio"}

@@ -152,17 +152,22 @@ export function makeCanvas(w: number, h: number): HTMLCanvasElement {
   return c;
 }
 
-/** ambil 1 frame ke canvas (dengan ukuran custom) */
+/** ambil 1 frame ke canvas (dengan ukuran custom).
+    v1.2.8 — `into` (opsional): pakai ulang canvas yang sama (hemat alokasi
+    untuk refine adegan & analisis panjang); bila kosong dibuat baru. */
 export async function grabFrame(
   v: HTMLVideoElement,
   t: number,
   w?: number,
-  h?: number
+  h?: number,
+  into?: HTMLCanvasElement
 ): Promise<HTMLCanvasElement> {
   await seekVideo(v, t);
   const cw = w ?? v.videoWidth;
   const ch = h ?? v.videoHeight;
-  const c = makeCanvas(cw, ch);
+  const c = into ?? makeCanvas(cw, ch);
+  if (c.width !== cw) c.width = cw;
+  if (c.height !== ch) c.height = ch;
   const ctx = c.getContext("2d", { willReadFrequently: false })!;
   ctx.drawImage(v, 0, 0, cw, ch);
   return c;
@@ -195,10 +200,15 @@ export async function sampleFrames(
 
 /* ---------- fitur frame untuk analisis ---------- */
 
-/** histogram warna terkuantisasi (RGB 3-bit/channel = 512 bin) */
-export function colorHistogram(ctx: CanvasRenderingContext2D, w: number, h: number): Float32Array {
+/** histogram warna terkuantisasi (RGB 3-bit/channel = 512 bin).
+    v1.2.8 — `out` (opsional): tulis ke array yang sama (tanpa alokasi baru). */
+export function colorHistogram(
+  ctx: CanvasRenderingContext2D, w: number, h: number,
+  out?: Float32Array
+): Float32Array {
+  const hist = out && out.length === 512 ? out : new Float32Array(512);
+  hist.fill(0);
   const data = ctx.getImageData(0, 0, w, h).data;
-  const hist = new Float32Array(512);
   const n = w * h;
   for (let i = 0; i < n; i++) {
     const r = data[i * 4] >> 5;

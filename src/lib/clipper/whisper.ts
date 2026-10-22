@@ -125,6 +125,37 @@ export const WHISPER_MODELS: Record<WhisperModel, { repo: string; label: string;
   small: { repo: "Xenova/whisper-small", label: "SMALL — akurat", size: "±270 MB" },
 };
 
+/* ---------- v1.2.8 — INGAT pilihan model & bahasa subtitle ----------
+   Panel menyimpan pilihan terakhir ke localStorage; OTOMATIS CERDAS
+   (ekspor dengan centang SUBTITLE AI) memakai pilihan yang sama. */
+const SUB_MODEL_KEY = "clipper-sub-model";
+const SUB_LANG_KEY = "clipper-sub-lang";
+
+export function saveSubPrefs(model: WhisperModel, lang: "id" | "en" | "auto") {
+  try {
+    localStorage.setItem(SUB_MODEL_KEY, model);
+    localStorage.setItem(SUB_LANG_KEY, lang);
+  } catch { /* abaikan */ }
+}
+
+export function subPersistedModel(): WhisperModel {
+  try {
+    const v = localStorage.getItem(SUB_MODEL_KEY) as WhisperModel | null;
+    return v && WHISPER_MODELS[v] ? v : "tiny";
+  } catch {
+    return "tiny";
+  }
+}
+
+export function subPersistedLang(): "id" | "en" | "auto" {
+  try {
+    const v = localStorage.getItem(SUB_LANG_KEY);
+    return v === "en" || v === "auto" ? v : "id";
+  } catch {
+    return "id";
+  }
+}
+
 export interface TranscribeMeta {
   backend?: "webgpu" | "wasm";
   threads?: number;
@@ -262,6 +293,51 @@ export function whisperReset() {
   setState({ running: false, p: 0, stage: "" });
 }
 
+/* ---------- v1.2.8 — PEMANASAN MODEL DI LATAR BELAKANG ----------
+   Dipanggil saat video diimpor (idle): runtime + model Whisper dimuat
+   di worker SEKARANG, sehingga saat tombol transkripsi ditekan tidak
+   ada lagi waktu tunggu "Memuat model…" (model tiny 0 dtk dari disk,
+   base/small 5–20 dtk dari cache IndexedDB). Sepenuhnya aman: worker
+   yang sama dipakai ulang oleh transcribe(). */
+let warmedModel: WhisperModel | null = null;
+let warmPromise: Promise<void> | null = null;
+export function warmWhisper(model: WhisperModel = "tiny") {
+  try {
+    if (warmedModel === model) return; // sudah panas / sedang dipanaskan
+    warmedModel = model;
+    const w = spawnWorker();
+    /* v1.2.8 — pantau selesainya pemanasan: transcribe() menunggu janji
+       ini sebelum mengirim "run", jadi warm & transkripsi tidak pernah
+       memuat model dua-duanya secara konkuren (penyebab Failed to fetch
+       pada beberapa mesin). */
+    warmPromise = new Promise<void>((resolve) => {
+      const fin = () => { try { w.removeEventListener("message", onMsg); } catch { /* aman */ } resolve(); };
+      const onMsg = (ev: MessageEvent) => {
+        const m: any = ev.data;
+        if (m && (m.type === "warm-ok" || m.type === "warm-fail")) fin();
+      };
+      w.addEventListener("message", onMsg);
+      // worker mati saat pemanasan → jangan biarkan transcribe menunggu selamanya
+      w.addEventListener("error", fin, { once: true });
+      w.postMessage({ type: "warm", model, gpu: whisperGpu() });
+    });
+  } catch {
+    /* pemanasan gagal → transkripsi nanti memuat model seperti biasa */
+  }
+}
+
+/** tunggu pemanasan berjalan selesai (aman dipanggil berkali-kali) */
+async function waitForWarm(): Promise<void> {
+  if (!warmPromise) return;
+  try { await warmPromise; } catch { /* abaikan */ }
+  warmPromise = null;
+}
+
+/** status pemanasan — dipakai UI bila ingin menampilkan "mesin siap" */
+export function whisperWarmed(): boolean {
+  return warmedModel !== null;
+}
+
 export interface WhisperResult {
   cues: { start: number; end: number; text: string }[];
   text: string;
@@ -307,6 +383,9 @@ async function transcribeInner(
   }
 ): Promise<WhisperResult> {
   const w = spawnWorker();
+  // v1.2.8 — bila pemanasan latar belakang sedang berjalan, tunggu dulu
+  // supaya model TIDAK dimuat dua kali bersamaan (race cache worker).
+  await waitForWarm();
   setState({ running: true, p: 0.01, stage: "Menyiapkan mesin AI di worker…", meta: {} });
 
   // v1.2.4 — WATCHDOG: kalau worker diam total > 180 dtk (mis. probe WebGPU

@@ -3,6 +3,6 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("clipperDesktop", {
   isElectron: true,
-  version: "1.2.7",
+  version: "1.2.8",
   onDownloadDone: (cb) => ipcRenderer.on("clipper-download-done", (_e, name) => cb(name)),
 });

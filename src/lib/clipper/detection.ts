@@ -101,6 +101,19 @@ export function detectorBackend(): "webgpu" | "wasm" {
   return backendKind;
 }
 
+/* v1.2.8 — PEMANASAN DETEKTOR DI LATAR BELAKANG.
+   YOLOS-tiny (±10 MB) diunduh & diinit saat pengguna masih memilih
+   split — saat analisis pembicara dimulai, AI sudah siap. Aman
+   dipanggil berkali-kali (hanya sekali yang benar-benar memuat). */
+let warmStarted = false;
+export function warmDetector() {
+  if (warmStarted || detectorCache) return;
+  warmStarted = true;
+  getDetector().catch(() => {
+    warmStarted = false; // gagal (mis. offline) → boleh coba lagi nanti
+  });
+}
+
 export interface DetBox {
   /** koordinat normalisasi 0..1 */
   x: number;

@@ -207,6 +207,17 @@ export interface ExportRange {
   end: number;
 }
 
+/** v1.2.8 — OTOMATIS CERDAS: centangan di panel EKSPOR.
+    Sebelum encode, antrean menjalankan sendiri AI yang dicentang:
+    • subtitle → transkripsi Whisper otomatis + bakar subtitle
+    • moment   → AI Momen Viral membagi video jadi momen terbaik
+    • speaker  → Zoom Pembicara otomatis menganalisis siapa bicara */
+export interface ExportAuto {
+  subtitle?: boolean;
+  moment?: boolean;
+  speaker?: boolean;
+}
+
 export interface ExportJob {
   id: string;
   name: string;
@@ -216,6 +227,8 @@ export interface ExportJob {
   status: "queued" | "running" | "done" | "error" | "canceled";
   progress: number;
   stage: string;
+  /** v1.2.8 — otomatisasi AI yang dijalankan sebelum encode */
+  auto?: ExportAuto;
   resultUrl?: string;
   resultName?: string;
   error?: string;

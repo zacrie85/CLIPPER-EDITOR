@@ -233,6 +233,24 @@ async function webgpuAvailable() {
 }
 
 /* pipeline WebGPU: fp32 encoder + q4 decoder (resep resmi demo HF) */
+
+/* v1.2.8 — DEDUPE: bila warm (pemanasan) dan transkripsi berjalan
+   BERSAMAAN, keduanya meminta pipeline model yang sama. Dulu dua
+   pemuatan konkuren bisa saling menabrak di cache (Failed to fetch
+   saat file besar diunduh dua-duanya). Kini satu janji tunggal:
+   pemanggil kedua menunggu pemuatan yang sedang berjalan. */
+const pipeBuilding = new Map();
+function buildPipeOnce(modelKey, onModelProgress, forceWasm = false) {
+  const key = modelKey + (forceWasm ? "|wasm" : "");
+  if (!pipeBuilding.has(key)) {
+    const p = buildPipe(modelKey, onModelProgress, forceWasm).finally(() => {
+      pipeBuilding.delete(key);
+    });
+    pipeBuilding.set(key, p);
+  }
+  return pipeBuilding.get(key);
+}
+
 async function buildPipe(modelKey, onModelProgress, forceWasm = false) {
   const info = MODELS[modelKey];
   const onProgress = (info2) => {
@@ -491,6 +509,41 @@ function cleanCues(rawChunks, offset) {
 /* ---------- pesan utama ---------- */
 self.onmessage = async (ev) => {
   const msg = ev.data;
+
+  /* ---------- v1.2.8 — PEMANASAN LATAR BELAKANG ----------
+     Muat runtime + model SEKARANG, saat pengguna masih mengatur
+     video (impor / pilih split). Saat transkripsi dimulai, mesin
+     sudah siap → hemat 5–20 detik pada proses pertama. Tanpa
+     transkripsi, tanpa status berjalan — benar-benar diam-diam. */
+  if (msg?.type === "warm") {
+    try {
+      if (msg.gpu === "off" || msg.gpu === "auto") gpuPref = msg.gpu;
+      T = await loadT();
+      try {
+        const [ortLocal, mdlLocal] = await Promise.all([ortWasmLocal(), modelsLocal()]);
+        const w = T.env?.backends?.onnx?.wasm;
+        if (w && ortLocal) {
+          w.wasmPaths = "/ort/";
+          w.proxy = false;
+          w.numThreads = numThreads();
+        }
+        if (T.env) {
+          T.env.allowLocalModels = true;
+          T.env.localModelPath = "/models/";
+          T.env.allowRemoteModels = true;
+          T.env.useBrowserCache = false;
+          T.env.customCache = AI_CACHE;
+        }
+      } catch { /* env default */ }
+      const mk = MODELS[msg.model] ? msg.model : "tiny";
+      await buildPipeOnce(mk, () => {});
+      try { self.postMessage({ type: "warm-ok", model: mk }); } catch { /* abaikan */ }
+    } catch (e) {
+      try { self.postMessage({ type: "warm-fail", message: String(e).slice(0, 160) }); } catch { /* abaikan */ }
+    }
+    return;
+  }
+
   if (msg?.type !== "run") return;
   const runId = ++currentRun;
   const { pcm, model, language, task, gpu } = msg;
@@ -528,12 +581,12 @@ self.onmessage = async (ev) => {
     };
     let built;
     try {
-      built = await buildPipe(model, onModel);
+      built = await buildPipeOnce(model, onModel);
     } catch (e) {
       // WebGPU bermasalah → paksa WASM q8 (cache pipeline GPU dibuang)
       send({ type: "stage", stage: "WebGPU tak tersedia — memakai WASM…", p: 0.06 });
       pipes = {};
-      built = await buildPipe(model, onModel, true);
+      built = await buildPipeOnce(model, onModel, true);
     }
 
     const { pipe, backend, threads } = built;

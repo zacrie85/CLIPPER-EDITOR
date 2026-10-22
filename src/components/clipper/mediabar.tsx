@@ -10,6 +10,8 @@ import { Film, Music2, Trash2, Upload, Box } from "lucide-react";
 import { useClipper } from "@/lib/clipper/store";
 import { importFiles, ACCEPT } from "@/lib/clipper/media";
 import { fmtTime, fmtSize } from "@/lib/clipper/format";
+import { warmWhisper, subPersistedModel } from "@/lib/clipper/whisper";
+import { warmDetector } from "@/lib/clipper/detection";
 
 export function MediaBar() {
   const media = useClipper((s) => s.media);
@@ -33,6 +35,14 @@ export function MediaBar() {
       if (items.length) {
         if (!selectedId) select(items[0].id);
         setToast(`${items.length} media masuk kotak${errors.length ? ` · ${errors.length} gagal` : ""}`);
+        /* v1.2.8 — PANASKAN MESIN AI DI LATAR BELAKANG: model Whisper
+           (worker) + YOLOS (detektor) dimuat SEKARANG, saat pengguna
+           masih memilih mode split. Saat AI dipakai, sudah siap —
+           tidak ada lagi "Memuat model…" di tengah proses.
+           Keduanya DIJEDA BERBEDA agar tidak berebut CPU/disk saat
+           impor besar berlangsung. */
+        setTimeout(() => warmWhisper(subPersistedModel()), 350);
+        setTimeout(() => warmDetector(), 3000);
       }
       if (errors.length) setToast(errors[0]);
     },

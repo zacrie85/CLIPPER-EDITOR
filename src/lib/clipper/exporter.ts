@@ -8,7 +8,6 @@
    ============================================================ */
 
 import { Muxer, ArrayBufferTarget, FileSystemWritableFileStreamTarget } from "mp4-muxer";
-import { obtainSaveDir, resolveSaveFile, getSaveMode } from "./savedir";
 import {
   RESOLUTIONS, type ClipSettings, type ExportJob, type ExportRange,
   type ExportSettings, type MediaItem, type SpeakerSegment,
@@ -18,8 +17,35 @@ import { seekVideo, makeCanvas, openVideo } from "./frames";
 import { decodeAudioFile, renderMix } from "./audio";
 import { composeMusic } from "./music";
 import { analyzeSpeaker, buildCropKeys, type SpeakerAnalysis } from "./speaker";
+import { ensureSubtitle, ensureMoments } from "./autopilot";
+import { cancelWhisper } from "./whisper";
 import { ensureFontsLoaded } from "./typography";
 import { downloadBlob, safeName, uid } from "./format";
+import { obtainSaveDir, resolveSaveFile, getSaveMode } from "./savedir";
+
+/* ============================================================
+   v1.2.8 — PENJAGA DIALOG FOLDER
+   Ditemukan di regresi E2E OTOMATIS CERDAS: showDirectoryPicker
+   bisa TIDAK PERNAH selesai (dialog tidak terlihat / tidak dijawab
+   / window tersembunyi) → seluruh antrean ekspor menggantung diam
+   di "Membaca audio…" tanpa pesan apa pun. Kini setiap permintaan
+   folder diberi batas waktu 120 dtk — lewat itu otomatis jatuh ke
+   jalur UNDUHAN (blob) dan ekspor tetap jalan.
+   ============================================================ */
+function obtainSaveDirSafe(): Promise<FileSystemDirectoryHandle | null> {
+  return Promise.race([
+    obtainSaveDir(false).catch(() => null),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 120_000)),
+  ]);
+}
+
+/** resolveSaveFile dengan penjaga dialog (120 dtk) → null = jalur unduhan */
+function resolveSaveFileSafe(name: string): Promise<FileSystemFileHandle | null> {
+  return Promise.race([
+    resolveSaveFile(name).catch(() => null),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 120_000)),
+  ]);
+}
 
 /* ============================================================
    v1.2.6 — ANTI-FREEZE EKSPOR
@@ -565,15 +591,69 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
   try {
     update({ status: "running", stage: "Mulai…", progress: 0, startedAt: Date.now() });
 
+    /* ============================================================
+       v1.2.8 — OTOMATIS CERDAS
+       Centangan di panel EKSPOR dijalankan DI SINI, sebelum encode:
+       1. SUBTITLE AI — transkripsi bila video belum punya cue;
+          hasil masuk ke store + snapshot clip job ini.
+       2. AI MOMEN — cari momen viral; RENTANG EKSPOR DIGANTI jadi
+          daftar momen (target otomatis berperilaku seperti split).
+       3. PEMBICARA — zoom pembicara dinyalakan untuk job ini
+          (analisis berjalan otomatis di exportOne). */
+    const auto = job.auto;
+    let clipUse = clip;
+    let ranges = rangesAll;
+    if (auto?.subtitle || auto?.moment || auto?.speaker) {
+      const main = media[0];
+      if (auto?.subtitle && main && main.type === "video") {
+        const cues = await ensureSubtitle(main, {
+          onProgress: (p, stage) => update({ progress: Math.min(p, 0.05), stage }),
+          isCancelled: () => cancelFlags.has(job.id),
+        });
+        clipUse = {
+          ...clipUse,
+          subtitle: {
+            ...clipUse.subtitle,
+            cues,
+            mode:
+              cues.length && clipUse.subtitle.mode === "off"
+                ? "burnin"
+                : clipUse.subtitle.mode,
+          },
+        };
+      }
+      if (auto?.moment && main && main.type === "video") {
+        let moments;
+        try {
+          moments = await ensureMoments(main, {
+            onProgress: (p, stage) => update({ progress: 0.06 + p * 0.04, stage }),
+            isCancelled: () => cancelFlags.has(job.id),
+          });
+          ranges = moments.map((m) => ({ mediaId: main.id, start: m.start, end: m.end }));
+        } catch (me) {
+          const msg = me instanceof Error ? me.message : String(me);
+          if (/Dibatalkan/.test(msg)) throw me;
+          // momen gagal / kosong → lanjut pakai rentang asli, jangan gagalkan ekspor
+          update({ stage: `AI MOMEN dilewati — ${msg.slice(0, 90)}` });
+        }
+      }
+      if (auto?.speaker) {
+        clipUse = {
+          ...clipUse,
+          speaker: { ...clipUse.speaker, enabled: true },
+        };
+      }
+    }
+
     if (job.target === "split") {
       // ekspor tiap bagian sebagai file terpisah
-      const parts = rangesAll;
+      const parts = ranges;
       /* v1.2.6 — audio 48 kHz dibaca SEKALI untuk semua bagian.
          Dulu: tiap bagian melakukan fetch + decode penuh berulang
          (20 bagian = 20× decode video panjang) → lambat & RAM meledak. */
       let audioPre: AudioBuffer | null = null;
       if (media[0].type === "video") {
-        update({ stage: `Membaca audio (sekali untuk ${parts.length} bagian)…`, progress: 0.004 });
+        update({ stage: `Membaca audio (sekali untuk ${parts.length} bagian)…`, progress: 0.1 });
         try {
           audioPre = await decodeAudioFile(media[0].url);
         } catch {
@@ -582,7 +662,8 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
       }
       let ok = 0;
       // v1.2.7 — folder simpanan diminta SEKALI di awal (bila mode FOLDER)
-      const useDir = getSaveMode() === "folder" ? await obtainSaveDir(false) : null;
+      // v1.2.8 — diberi batas waktu: dialog tak dijawab = jatuh ke UNDUHAN
+      const useDir = getSaveMode() === "folder" ? await obtainSaveDirSafe() : null;
       for (let i = 0; i < parts.length; i++) {
         if (cancelFlags.has(job.id)) throw new Error("Dibatalkan");
         const r = parts[i];
@@ -591,12 +672,12 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
         const blob = await exportOne({
           media: media[0],
           ranges: [{ start: r.start, end: r.end }],
-          clip: clip,
+          clip: clipUse,
           name: `${job.name}_part${String(i + 1).padStart(2, "0")}`,
           audioPre,
           fileHandle: fh,
           onProgress: (p, stage) =>
-            update({ progress: (i + p) / parts.length * 0.99, stage: `Bagian ${i + 1}/${parts.length} — ${stage}` }),
+            update({ progress: 0.1 + ((i + p) / parts.length) * 0.89, stage: `Bagian ${i + 1}/${parts.length} — ${stage}` }),
           shouldCancel: () => cancelFlags.has(job.id),
         });
         if (blob) {
@@ -620,23 +701,57 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
       let ok = 0;
       const gagal: string[] = [];
       // v1.2.7 — folder simpanan diminta SEKALI di awal (bila mode FOLDER)
-      const useDirB = getSaveMode() === "folder" ? await obtainSaveDir(false) : null;
+      // v1.2.8 — diberi batas waktu: dialog tak dijawab = jatuh ke UNDUHAN
+      const useDirB = getSaveMode() === "folder" ? await obtainSaveDirSafe() : null;
       for (let i = 0; i < rangesAll.length; i++) {
         if (cancelFlags.has(job.id)) throw new Error("Dibatalkan");
         const r = rangesAll[i];
         const m = media[i] ?? media[0];
         try {
+          /* v1.2.8 — OTOMATIS CERDAS per video: subtitle & momen
+             dianalisis untuk SETIAP video di batch (bukan hanya video
+             pertama), lalu encode memakai hasilnya. */
+          let clipV = clipUse;
+          let rangesV: { start: number; end: number }[] = [{ start: r.start, end: r.end }];
+          if (auto?.subtitle && m.type === "video") {
+            const cuesV = await ensureSubtitle(m, {
+              onProgress: (p, stage) =>
+                update({ progress: (i + Math.min(p, 0.05)) / rangesAll.length * 0.95, stage: `Video ${i + 1}/${rangesAll.length} — ${stage}` }),
+              isCancelled: () => cancelFlags.has(job.id),
+            });
+            clipV = {
+              ...clipV,
+              subtitle: {
+                ...clipV.subtitle,
+                cues: cuesV,
+                mode: cuesV.length && clipV.subtitle.mode === "off" ? "burnin" : clipV.subtitle.mode,
+              },
+            };
+          }
+          if (auto?.moment && m.type === "video") {
+            try {
+              const mo = await ensureMoments(m, {
+                onProgress: (p, stage) =>
+                  update({ progress: (i + 0.06 + p * 0.04) / rangesAll.length * 0.95, stage: `Video ${i + 1}/${rangesAll.length} — ${stage}` }),
+                isCancelled: () => cancelFlags.has(job.id),
+              });
+              rangesV = mo.map((x) => ({ start: x.start, end: x.end }));
+            } catch (me) {
+              if (/Dibatalkan/.test(me instanceof Error ? me.message : String(me))) throw me;
+              /* momen kosong → video ini diekspor utuh */
+            }
+          }
           const outName = `${safeName(m.name)}_${String(i + 1).padStart(2, "0")}.mp4`;
           const fh = useDirB ? await resolveSaveFile(outName) : null;
           const blob = await exportOne({
             media: m,
-            ranges: [{ start: r.start, end: r.end }],
-            clip: { ...clip },
+            ranges: rangesV,
+            clip: clipV,
             name: `${job.name}_video${String(i + 1).padStart(2, "0")}`,
             fileHandle: fh,
             onProgress: (p, stage) =>
               update({
-                progress: (i + p) / rangesAll.length * 0.99,
+                progress: (i + 0.1 + p * 0.85) / rangesAll.length,
                 stage: `Video ${i + 1}/${rangesAll.length} (${m.name.slice(0, 24)}) — ${stage}`,
               }),
             shouldCancel: () => cancelFlags.has(job.id),
@@ -667,14 +782,15 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
       // encode (tanpa blob besar di RAM). Gagal pilih folder → jalur
       // unduhan browser + pengeccek kesehatan blob (bukan 0 byte diam).
       const outName = `${safeName(job.name)}.mp4`;
-      const fh = getSaveMode() === "folder" ? await resolveSaveFile(outName) : null;
+      // v1.2.8 — penjaga dialog: tak dijawab 120 dtk → jatuh ke unduhan
+      const fh = getSaveMode() === "folder" ? await resolveSaveFileSafe(outName) : null;
       const blob = await exportOne({
         media: media[0],
-        ranges: rangesAll.map((r) => ({ start: r.start, end: r.end })),
-        clip: { ...clip },
+        ranges: ranges.map((r) => ({ start: r.start, end: r.end })),
+        clip: clipUse,
         name: job.name,
         fileHandle: fh,
-        onProgress: (p, stage) => update({ progress: p * 0.99, stage }),
+        onProgress: (p, stage) => update({ progress: 0.1 + p * 0.89, stage }),
         shouldCancel: () => cancelFlags.has(job.id),
       });
       if (blob) {
@@ -689,12 +805,16 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
 
     // merge multi-sumber
     const mergeName = `${safeName(job.name)}.mp4`;
-    const mergeFh = getSaveMode() === "folder" ? await resolveSaveFile(mergeName) : null;
+    // v1.2.8 — penjaga dialog: tak dijawab 120 dtk → jatuh ke unduhan
+    const mergeFh = getSaveMode() === "folder" ? await resolveSaveFileSafe(mergeName) : null;
+    // v1.2.8 — momen hanya mengganti rentang bila merge satu sumber;
+    // merge banyak video tetap memakai rentang utuh per video.
+    const mergeRanges = auto?.moment && media.length > 1 ? rangesAll : ranges;
     const blob = await exportMerge(
-      media.map((m, i) => ({ media: m, ranges: [rangesAll[i]] })),
-      clip,
+      media.map((m, i) => ({ media: m, ranges: [mergeRanges[i] ?? rangesAll[i]] })),
+      clipUse,
       job.name,
-      (p, stage) => update({ progress: p * 0.99, stage }),
+      (p, stage) => update({ progress: 0.1 + p * 0.89, stage }),
       () => cancelFlags.has(job.id),
       mergeFh
     );
@@ -707,6 +827,11 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    // v1.2.8 — bila dibatalkan di tengah transkripsi otomatis, matikan
+    // worker Whisper agar tidak terus berjalan di latar belakang.
+    if (msg === "Dibatalkan") {
+      try { cancelWhisper(); } catch { /* aman */ }
+    }
     update({
       status: msg === "Dibatalkan" ? "canceled" : "error",
       error: msg,
