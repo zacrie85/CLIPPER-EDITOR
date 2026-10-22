@@ -91,7 +91,13 @@ export function Preview() {
         setBusy("Analisis zoom pembicara…");
         const a = await getCachedSpeaker(media as MediaItem, settings.speaker);
         if (!alive) return;
-        keysRef.current = buildCropKeys(a, settings.speaker, (media.width || 16) / (media.height || 9));
+        // v1.2.9 — jendela crop mengikuti rasio pratinjau (9:16/16:9)
+        keysRef.current = buildCropKeys(
+          a,
+          settings.speaker,
+          (media.width || 16) / (media.height || 9),
+          settings.export.aspect === "9:16" ? 9 / 16 : 16 / 9
+        );
         setBusy(null);
         setToast(
           a.fallback
@@ -109,7 +115,7 @@ export function Preview() {
       alive = false;
     };
      
-  }, [media?.id, speakerOn, settings.speaker.transition, settings.speaker.speed, settings.speaker.silent, settings.speaker.useFace, settings.speaker.useAudio]);
+  }, [media?.id, speakerOn, settings.export.aspect, settings.speaker.transition, settings.speaker.speed, settings.speaker.silent, settings.speaker.useFace, settings.speaker.useAudio]);
 
   /* ---------- ukuran canvas ---------- */
   const fitCanvas = useCallback(() => {

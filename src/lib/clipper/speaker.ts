@@ -330,22 +330,34 @@ export interface CropKey {
 
 const SPEED_DUR: Record<string, number> = { fast: 0.25, normal: 0.5, slow: 1.0 };
 
-/** bangun keyframe crop dari hasil analisis */
+/** bangun keyframe crop dari hasil analisis.
+    v1.2.9 — RUMUS CROP DIPERBAIKI + RASIO TARGET:
+    Dulu SEMUA jendela crop dihitung dengan rasio TERBALIK
+    (h = w/(9/16)/srcAspect → jendela ber-rasio 16:9) lalu dilempar
+    ke kanvas 9:16 → hasil video MELEBAR/PIPIH (distorsi parah,
+    wajah cepul). Kini rasio DIJAMIN tepat:
+      (w/h) × srcAspect = targetRasio
+    sehingga jendela crop benar-benar memotong KIRI-KANAN (9:16) atau
+    ATAS-BAWAH (16:9), mengikuti posisi pembicara.
+    targetRatio: 9/16 (default, vertikal) atau 16/9 (landscape). */
 export function buildCropKeys(
   analysis: SpeakerAnalysis,
   cfg: SpeakerConfig,
-  srcAspect: number // w/h sumber
+  srcAspect: number, // w/h sumber
+  targetRatio: number = 9 / 16
 ): CropKey[] {
   const keys: CropKey[] = [];
+  const R = targetRatio > 1 ? 16 / 9 : 9 / 16; // hanya dua rasio yang valid
   const persons = analysis.persons.length
     ? [...analysis.persons].sort((a, b) => a.box.x - b.box.x)
     : [];
 
   const wideCrop = (): { x: number; y: number; w: number; h: number } => {
-    // fit seluruh frame — 9:16 center crop lebar penuh
-    const w = 1;
-    const h = Math.min(1, w / (9 / 16) / srcAspect);
-    return { x: 0, y: (1 - h) / 2, w, h };
+    // v1.2.9 — jendela selebar mungkin DENGAN rasio target (bukan full frame
+    // yang diperas!): sumber 16:9 + target 9:16 → potong kiri-kanan tengah.
+    const h = 1;
+    const w = Math.min(1, R / srcAspect);
+    return { x: (1 - w) / 2, y: (1 - h) / 2, w, h };
   };
 
   const personCrop = (idx: number): { x: number; y: number; w: number; h: number } | null => {
@@ -353,13 +365,13 @@ export function buildCropKeys(
     if (!p) return null;
     const pad = 0.55; // ruang di sekitar orang
     let w = Math.min(1, p.box.w * (1 + pad * 2));
-    // jaga rasio 9:16 pada crop
-    let h = w / (9 / 16) / srcAspect;
+    // jaga rasio target pada crop: (w/h)*srcAspect = R
+    let h = (w * srcAspect) / R;
     if (h > 1) {
       h = 1;
-      w = h * (9 / 16) * srcAspect;
+      w = R / srcAspect;
     }
-    if (w > 1) { w = 1; h = w / (9 / 16) / srcAspect; }
+    if (w > 1) { w = 1; h = srcAspect / R; }
     const cx = p.box.x + p.box.w / 2;
     const cy = p.box.y + p.box.h * 0.42; // sedikit di atas tengah (wajah)
     return {
@@ -372,14 +384,13 @@ export function buildCropKeys(
   // fallback 2-bagian
   const zoneCrop = (zone: 0 | 1 | -1) => {
     if (zone === -1) return wideCrop();
-    const w = 0.5;
-    const h = w / (9 / 16) / srcAspect;
-    if (h > 1) {
-      const h2 = 1;
-      const w2 = h2 * (9 / 16) * srcAspect;
-      return { x: zone === 0 ? 0 : 1 - w2, y: 0, w: w2, h: h2 };
-    }
-    return { x: zone === 0 ? 0 : 0.5, y: (1 - h) / 2, w, h };
+    // v1.2.9 — paruh kiri/kanan DENGAN rasio target benar:
+    // jendela dipusatkan di tengah tiap paruh (0,25 / 0,75) — dulu
+    // w=0,5 telanjang → 16:9 diperas ke 9:16 (distorsi).
+    const h = 1;
+    const w = Math.min(1, R / srcAspect);
+    const cx = zone === 0 ? 0.25 : 0.75;
+    return { x: clamp(cx - w / 2, 0, 1 - w), y: (1 - h) / 2, w, h };
   };
 
   const activeCrop = (person: number, zone: 0 | 1 | -1) => {

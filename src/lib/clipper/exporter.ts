@@ -141,9 +141,18 @@ export function outputDims(settings: ExportSettings, srcW: number, srcH: number)
   const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
   if (settings.autoMode) {
     const k = settings.scale / 100;
-    const dims = even(srcW * k), evenh = even(srcH * k);
-    // rasio mengikuti sumber; vertikal dibalik sesuai konvensi
-    return { w: dims, h: evenh };
+    let w = even(srcW * k), h = even(srcH * k);
+    /* v1.2.9 — BUG FATAL DIPERBAIKI: dulu mode AUTO SELALU ikut rasio
+       sumber — chip RASIO 9:16 DIABAIKAN total, jadi hasil ekspor
+       (termasuk AI MOMEN) tetap LANDSCAPE walau user pilih vertikal.
+       Kini AUTO menghormati RASIO: 9:16 → dimensi DITUKAR jadi portrait
+       (renderer memotong kiri-kanan lewat baseCrop / crop pembicara). */
+    if (settings.aspect === "9:16" && w > h) {
+      const t = w; w = h; h = t;
+    } else if (settings.aspect === "16:9" && h > w) {
+      const t = w; w = h; h = t;
+    }
+    return { w, h };
   }
   // v1.2.7 — guard: resolusi tak dikenal (mis. localStorage korup) jangan
   // sampai TypeError merobohkan seluruh UI — jatuh ke 720p.
@@ -400,7 +409,13 @@ export async function exportOne(opts: ExportOneOptions): Promise<Blob | null> {
   if (clip.speaker.enabled) {
     opts.onProgress?.(0.08, "Analisis zoom pembicara…");
     const analysis = await getCachedSpeaker(media, clip.speaker);
-    keys = buildCropKeys(analysis, clip.speaker, (media.width || 16) / (media.height || 9));
+    // v1.2.9 — jendela crop kini mengikuti RASIO OUTPUT (9:16/16:9)
+    keys = buildCropKeys(
+      analysis,
+      clip.speaker,
+      (media.width || 16) / (media.height || 9),
+      settings.aspect === "9:16" ? 9 / 16 : 16 / 9
+    );
   }
 
   const totalFrames = Math.ceil(totalDur * fps);
@@ -636,6 +651,13 @@ async function runJob(job: ExportJob, media: MediaItem[], clip: ClipSettings, up
           // momen gagal / kosong → lanjut pakai rentang asli, jangan gagalkan ekspor
           update({ stage: `AI MOMEN dilewati — ${msg.slice(0, 90)}` });
         }
+        /* v1.2.9 — JARING PENGAMAN VERTIKAL: ekspor hasil AI MOMEN
+           SELALU 9:16 (klip vertikal TikTok/Shorts/Reels — potong
+           kiri-kanan, fokus pembicara), apa pun chip rasio semula. */
+        clipUse = {
+          ...clipUse,
+          export: { ...clipUse.export, aspect: "9:16" },
+        };
       }
       if (auto?.speaker) {
         clipUse = {
@@ -939,7 +961,13 @@ async function exportMulti(
     let keys: CropKey[] | null = null;
     if (clip.speaker.enabled) {
       const analysis = await getCachedSpeaker(src.media, clip.speaker);
-      keys = buildCropKeys(analysis, clip.speaker, (src.media.width || 16) / (src.media.height || 9));
+      // v1.2.9 — jendela crop mengikuti rasio output
+      keys = buildCropKeys(
+        analysis,
+        clip.speaker,
+        (src.media.width || 16) / (src.media.height || 9),
+        settings.aspect === "9:16" ? 9 / 16 : 16 / 9
+      );
     }
 
     // audio sumber → decode sekali per sumber

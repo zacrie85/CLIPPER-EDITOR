@@ -407,6 +407,9 @@ export function ExportPanel() {
       <Row label="RASIO">
         <Chip active={clip.export.aspect === "16:9"} onClick={() => patchExport({ aspect: "16:9" })}>16:9</Chip>
         <Chip active={clip.export.aspect === "9:16"} onClick={() => patchExport({ aspect: "9:16" })}>9:16 VERTIKAL</Chip>
+        {auto.moment && clip.export.aspect !== "9:16" && (
+          <span className="text-[9.5px] text-primary font-bold">⚠ AI MOMEN tetap dipaksa 9:16</span>
+        )}
       </Row>
       <Row label="FPS">
         {([24, 30, 60] as const).map((f) => (
@@ -488,8 +491,15 @@ export function ExportPanel() {
         <div className="grid grid-cols-3 gap-1.5">
           <Chip
             active={auto.moment}
-            onClick={() => setAuto((a) => ({ ...a, moment: !a.moment }))}
-            title="AI cari momen viral (hook/pacing/konteks) → tiap momen jadi file sendiri. Tidak perlu analisis manual dulu."
+            onClick={() => {
+              const next = !auto.moment;
+              setAuto((a) => ({ ...a, moment: next, speaker: next ? true : a.speaker }));
+              /* v1.2.9 — AI MOMEN = klip vertikal: rasio otomatis pindah
+                 ke 9:16 (potong kiri-kanan, fokus pembicara) + zoom
+                 pembicara menyala supaya hasil langsung seperti TikTok. */
+              if (next) patchExport({ aspect: "9:16" });
+            }}
+            title="AI cari momen viral (hook/pacing/konteks) → tiap momen jadi file vertikal 9:16 sendiri. Zoom pembicara menyala otomatis."
           >
             <Flame size={11} className="inline mr-1" /> AI MOMEN
           </Chip>
@@ -513,12 +523,12 @@ export function ExportPanel() {
             <>
               <b className="text-foreground">Saat tombol ekspor ditekan, aplikasi berjalan sendiri:</b>{" "}
               {auto.subtitle && <>① SUBTITLE AI (transkripsi offline) </>}
-              {auto.moment && <>② AI MOMEN (video dibagi ke momen terbaik — bagian split diabaikan) </>}
-              {auto.speaker && <>③ PEMBICARA (kamera zoom otomatis) </>}
+              {auto.moment && <>② AI MOMEN (video dibagi ke momen terbaik — hasil <b className="text-primary">9:16 VERTIKAL, potong kiri-kanan</b> — bagian split diabaikan) </>}
+              {auto.speaker && <>③ PEMBICARA (potongan kamera mengikuti orang yang bicara) </>}
               ④ ENCODE MP4. Hasil analisis tersimpan — panel AI Momen &amp; Subtitle menampilkan yang sama.
             </>
           ) : (
-            <>Belum ada yang dicentang — ekspor murni encode. Centang di atas untuk AI otomatis: tiap momen jadi file / subtitle terbakar / kamera ikut pembicara.</>
+            <>Belum ada yang dicentang — ekspor murni encode. Centang di atas untuk AI otomatis: tiap momen jadi file vertikal / subtitle terbakar / kamera ikut pembicara.</>
           )}
         </div>
       </div>

@@ -6,7 +6,7 @@
    100% offline: transkrip Whisper + energi audio + adegan
    ============================================================ */
 
-import { useRef, useState } from "react";
+import { useRef, useState, useEffect } from "react";
 import { Flame, Play, Scissors, Download, Merge, Sparkles } from "lucide-react";
 import { useClipper } from "@/lib/clipper/store";
 import { analyzeMoments } from "@/lib/clipper/momentfinder";
@@ -25,6 +25,16 @@ const LENS: { key: number | "auto"; label: string }[] = [
   { key: 30, label: "30s" },
   { key: 60, label: "60s" },
 ];
+
+/* v1.2.9 — zoom pembicara ikut menyala saat ekspor momen (default ON) */
+const SPK_KEY = "clipper-momen-speaker";
+function loadSpk(): boolean {
+  try {
+    const raw = localStorage.getItem(SPK_KEY);
+    if (raw !== null) return raw === "1";
+  } catch { /* abaikan */ }
+  return true;
+}
 
 function useSelected(): MediaItem | undefined {
   return useClipper((s) => s.media.find((m) => m.id === s.selectedId));
@@ -57,6 +67,11 @@ export function MomentsPanel() {
   const [progress, setProgress] = useState(0);
   const [stage, setStage] = useState("");
   const ranRef = useRef(false);
+  /* v1.2.9 — potongan kamera mengikuti pembicara saat ekspor momen */
+  const [spk, setSpk] = useState<boolean>(() => loadSpk());
+  useEffect(() => {
+    try { localStorage.setItem(SPK_KEY, spk ? "1" : "0"); } catch { /* abaikan */ }
+  }, [spk]);
 
   const hasTranscript = cues.length > 0;
 
@@ -71,10 +86,13 @@ export function MomentsPanel() {
       name,
       target,
       ranges,
-      settings: { ...st.settings.export },
+      settings: { ...st.settings.export, aspect: "9:16" as const },
       status: "queued" as const,
       progress: 0,
       stage: "Menunggu antrean…",
+      /* v1.2.9 — zoom pembicara ikut dianalisis otomatis saat ekspor
+         (potongan kamera mengikuti orang yang bicara, hasil 9:16) */
+      auto: spk ? { subtitle: false, moment: false, speaker: true } : undefined,
     };
     st.addJob(job);
     /* v1.2.6 — dulu job momen dipanggil LANGSUNG tanpa antrean: bisa berjalan
@@ -85,7 +103,18 @@ export function MomentsPanel() {
       getClip: () => useClipper.getState().settings,
       update: (id, p) => useClipper.getState().updateJob(id, p),
     });
-    enqueueExportJob(job);
+    /* v1.2.9 — ctx khusus job momen: RASIO DIPAKSA 9:16 VERTIKAL
+       (klip TikTok/Shorts/Reels — kiri-kanan dipotong, fokus pembicara).
+       Dulu memakai setelan panel apa adanya (default 16:9) → hasil
+       landscape — keluhan user v1.2.8. */
+    enqueueExportJob(job, {
+      getMedia: (id) => useClipper.getState().media.find((m) => m.id === id),
+      getClip: () => {
+        const s = useClipper.getState().settings;
+        return { ...s, export: { ...s.export, aspect: "9:16" } };
+      },
+      update: (id, p) => useClipper.getState().updateJob(id, p),
+    });
   };
 
   const run = async () => {
@@ -186,6 +215,10 @@ export function MomentsPanel() {
         Sinyal: transkrip Whisper {hasTranscript ? "✓ tersedia" : "(belum ada)"} + energi audio + potongan adegan.
         100% offline.
       </Note>
+      <Note>
+        <b className="text-primary">v1.2.9:</b> semua hasil ekspor momen kini <b className="text-foreground">9:16 VERTIKAL</b> —
+        bagian kiri &amp; kanan video landscape dipotong sehingga pembicara memenuhi layar (bukan dikecilkan / diberi garis hitam).
+      </Note>
 
       <div className="flex items-center justify-between gap-2">
         <span className="clip-label shrink-0">DURASI KLIP</span>
@@ -195,6 +228,22 @@ export function MomentsPanel() {
               {l.label}
             </Chip>
           ))}
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between gap-2">
+        <span className="clip-label shrink-0">HASIL EKSPOR</span>
+        <div className="flex gap-1 flex-wrap justify-end">
+          <Chip active title="Hasil ekspor momen selalu 9:16 vertikal — kiri/kanan dipotong, pembicara fokus penuh (TikTok/Reels/Shorts)">
+            📱 9:16 VERTIKAL
+          </Chip>
+          <Chip
+            active={spk}
+            onClick={() => setSpk((v) => !v)}
+            title="Potongan kamera otomatis mengikuti orang yang sedang bicara (AI deteksi orang offline)"
+          >
+            👤 ZOOM PEMBICARA
+          </Chip>
         </div>
       </div>
 
