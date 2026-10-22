@@ -513,7 +513,7 @@ export function ExportPanel() {
           <Chip
             active={auto.speaker}
             onClick={() => setAuto((a) => ({ ...a, speaker: !a.speaker }))}
-            title="Zoom mengikuti orang yang sedang bicara — analisis berjalan otomatis saat ekspor"
+            title="Zoom mengikuti orang yang sedang bicara. Video panjang: analisis 1–5 menit di BAGIAN PERTAMA saja (sekali untuk semua bagian) — progress selalu bergerak, AI bermasalah = lanjut mode audio otomatis."
           >
             <Users size={11} className="inline mr-1" /> PEMBICARA
           </Chip>
@@ -524,7 +524,7 @@ export function ExportPanel() {
               <b className="text-foreground">Saat tombol ekspor ditekan, aplikasi berjalan sendiri:</b>{" "}
               {auto.subtitle && <>① SUBTITLE AI (transkripsi offline) </>}
               {auto.moment && <>② AI MOMEN (video dibagi ke momen terbaik — hasil <b className="text-primary">9:16 VERTIKAL, potong kiri-kanan</b> — bagian split diabaikan) </>}
-              {auto.speaker && <>③ PEMBICARA (potongan kamera mengikuti orang yang bicara) </>}
+              {auto.speaker && <>③ PEMBICARA (potongan kamera mengikuti orang yang bicara — video panjang: analisis 1–5 mnt di bagian pertama, sekali saja) </>}
               ④ ENCODE MP4. Hasil analisis tersimpan — panel AI Momen &amp; Subtitle menampilkan yang sama.
             </>
           ) : (

@@ -19,7 +19,7 @@
    ============================================================ */
 
 import { useClipper } from "./store";
-import { decodeAudioFile16k, decodeAudioFile, rmsEnvelope } from "./audio";
+import { decodeAudioFile16k, monoRmsEnvelope } from "./audio";
 import { detectScenes } from "./scenedetect";
 import { analyzeMoments, type MomentSuggestion } from "./momentfinder";
 import {
@@ -151,13 +151,29 @@ export async function ensureMoments(
   const cancel = opts?.isCancelled;
   if (cancel?.()) throw new Error("Dibatalkan");
 
-  // 2) envelope audio — 16 kHz (v1.2.8: 3–4× lebih cepat dari 48 kHz)
+  // 2) envelope audio — v1.2.10: decode 16 kHz mono 3-strategi (tahan
+  //    banting, ada detak jantung & batal — dulu decodeAudioFile bisa
+  //    menggantung/mati di video panjang → AI MOMEN "stak di 7%")
   opts?.onProgress?.(0.02, "AI MOMEN — membaca gelombang audio…");
   let env: { t: number; rms: number }[] = [];
   try {
-    const buf = await decodeAudioFile(media.url, 120_000, 16000);
-    env = rmsEnvelope(buf, 0.25);
-  } catch {
+    const mono = await decodeAudioFile16k(
+      media.url,
+      (mb, totalMb) => {
+        opts?.onProgress?.(
+          0.04,
+          totalMb
+            ? `AI MOMEN — membaca audio ${mb.toFixed(0)}/${totalMb.toFixed(0)} MB…`
+            : `AI MOMEN — membaca audio ${mb.toFixed(0)} MB…`
+        );
+      },
+      () => !!cancel?.(),
+      (s) => opts?.onProgress?.(0.05, `AI MOMEN — ${s}`)
+    );
+    env = monoRmsEnvelope(mono, 16000, 0.25);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/Dibatalkan/.test(msg)) throw e;
     env = []; // tanpa audio → analisis visual saja
   }
   if (cancel?.()) throw new Error("Dibatalkan");

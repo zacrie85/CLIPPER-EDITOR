@@ -124,7 +124,19 @@ export async function decodeAudioFile16k(
     let loaded = 0;
     for (;;) {
       if (isCancelled?.()) throw new Error("Dibatalkan");
-      const { done, value } = await reader.read();
+      /* v1.2.10 — PENJAGA MACET UNDUHAN: 45 dtk tanpa data baru = error
+         JELAS dengan posisi MB (dulu: reader.read() bisa menggantung
+         selamanya di tengah file besar — terlihat "stak di 129 MB"). */
+      let stallTimer: ReturnType<typeof setTimeout> | undefined;
+      const { done, value } = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, rej) => {
+          stallTimer = setTimeout(
+            () => rej(new Error(`Unduhan audio macet di ${Math.round(loaded / 1048576)} MB (45 dtk tanpa data) — coba lagi`)),
+            45_000
+          );
+        }),
+      ]).finally(() => clearTimeout(stallTimer));
       if (done) break;
       chunks.push(value);
       loaded += value.byteLength;
@@ -270,6 +282,26 @@ function resampleLinear(input: Float32Array, from: number, to: number): Float32A
     const i1 = Math.min(input.length - 1, i0 + 1);
     const f = pos - i0;
     out[i] = input[i0] * (1 - f) + input[i1] * f;
+  }
+  return out;
+}
+
+/** envelope RMS dari PCM mono 16 kHz (hasil decodeAudioFile16k) —
+    v1.2.10 dipakai AI MOMEN agar analisis panjang tetap tahan banting */
+export function monoRmsEnvelope(
+  mono: Float32Array,
+  sr = 16000,
+  winSec = 0.25
+): { t: number; rms: number }[] {
+  const win = Math.max(1, Math.floor(winSec * sr));
+  const n = Math.floor(mono.length / win);
+  const out: { t: number; rms: number }[] = [];
+  for (let i = 0; i < n; i++) {
+    let sum = 0;
+    const base = i * win;
+    for (let j = 0; j < win; j += 4) sum += mono[base + j] * mono[base + j];
+    const cnt = Math.ceil(win / 4);
+    out.push({ t: (i * win) / sr, rms: Math.sqrt(sum / cnt) });
   }
   return out;
 }

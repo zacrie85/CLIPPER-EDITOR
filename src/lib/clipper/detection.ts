@@ -12,6 +12,15 @@
    • Bila WebGPU gagal memuat / crash saat dipakai → otomatis pulih
      ke WASM q8 SEKALI JALAN (tidak mengulang percobaan GPU tiap
      frame) — hasil analisis tetap jalan di semua mesin.
+
+   v1.2.10 — ANTI-BEKU (laporan: ekspor PEMBICARA berhenti di 11%):
+   • INFERENSI BER-BATAS WAKTU — pipe() kini dibatasi 30 dtk.
+     Dulu TANPA batas: driver WebGPU macet (device hang tanpa error)
+     = await pipe() menggantung SELAMANYA → seluruh analisis &
+     ekspor mati diam. Kini timeout = dianggap gagal → pulih ke WASM.
+   • failStreak — 3 kegagalan berturut-turut = error instan tanpa
+     mencoba lagi (pemanggil jatuh ke mode audio-only).
+   • MUAT MODEL WASM BER-BATAS WAKTU 180 dtk (dulu tanpa batas).
    ============================================================ */
 
 import { loadTransformers } from "./whisper";
@@ -88,10 +97,15 @@ export async function getDetector(
   }
 
   // 2) WASM q8 — selalu bisa (±10 MB)
-  detectorCache = await T.pipeline("object-detection", "Xenova/yolos-tiny", {
-    dtype: "q8",
-    progress_callback: cb,
-  });
+  //    v1.2.10 — muat model berbatas waktu (dulu bisa menggantung selamanya)
+  detectorCache = await withTimeout(
+    T.pipeline("object-detection", "Xenova/yolos-tiny", {
+      dtype: "q8",
+      progress_callback: cb,
+    }),
+    180_000,
+    "Memuat model WASM"
+  );
   backendKind = "wasm";
   return detectorCache;
 }
@@ -124,13 +138,25 @@ export interface DetBox {
   label: string;
 }
 
+/* v1.2.10 — hitung kegagalan berturut-turut: 3× = AI benar-benar
+   sakit di mesin ini → error instan (tanpa menunggu timeout lagi)
+   agar pemanggil segera jatuh ke mode audio-only. */
+let failStreak = 0;
+const INFERENCE_TIMEOUT = 30_000;
+
 /** deteksi orang pada satu frame canvas → kotak normalisasi.
     v1.2.7 — bila inferensi WebGPU gagal/crash di tengah pemakaian,
-    detector dibangun ulang sebagai WASM SEKALI lalu dicoba ulang. */
+    detector dibangun ulang sebagai WASM SEKALI lalu dicoba ulang.
+    v1.2.10 — inferensi dibatasi 30 dtk; timeout = pulih ke WASM. */
 export async function detectPersons(canvas: HTMLCanvasElement): Promise<DetBox[]> {
   const run = async (): Promise<DetBox[]> => {
     const pipe = await getDetector();
-    const out = await pipe(canvas, { threshold: 0.55, percentage: true });
+    // v1.2.10 — BATAS WAKTU INFERENSI (dulu tanpa batas → bisa menggantung selamanya)
+    const out = await withTimeout(
+      pipe(canvas, { threshold: 0.55, percentage: true }),
+      INFERENCE_TIMEOUT,
+      "Deteksi orang"
+    );
     const boxes: DetBox[] = [];
    
     for (const r of out as any[]) {
@@ -154,13 +180,21 @@ export async function detectPersons(canvas: HTMLCanvasElement): Promise<DetBox[]
     return boxes;
   };
 
+  // v1.2.10 — 3 kegagalan berturut-turut: jangan buang waktu menunggu
+  // timeout berulang — lempar segera (pemanggil beralih ke audio-only)
+  if (failStreak >= 3) {
+    throw new Error("Deteksi orang gagal berulang di mesin ini");
+  }
   try {
-    return await run();
+    const r = await run();
+    failStreak = 0;
+    return r;
   } catch (e) {
+    failStreak++;
     if (backendKind === "webgpu" && !gpuBroken) {
       gpuBroken = true;
       detectorCache = null;
-      try { console.warn("[detection] WebGPU gagal saat inferensi — pulih ke WASM sekali:", String(e).slice(0, 120)); } catch {}
+      try { console.warn("[detection] WebGPU gagal/timeout saat inferensi — pulih ke WASM sekali:", String(e).slice(0, 120)); } catch {}
       return await run(); // percobaan tunggal dengan WASM
     }
     throw e;

@@ -125,12 +125,14 @@ const speakerCache = new Map<string, SpeakerAnalysis>();
 export async function getCachedSpeaker(
   media: MediaItem,
   cfg: ClipSettings["speaker"],
-  onProgress?: (p: number, s: string) => void
+  onProgress?: (p: number, s: string) => void,
+  isCancelled?: () => boolean
 ): Promise<SpeakerAnalysis> {
   const key = `${media.id}|${cfg.useFace}|${cfg.useAudio}|${cfg.silent}`;
   const hit = speakerCache.get(key);
   if (hit) return hit;
-  const a = await analyzeSpeaker(media.url, media.duration, cfg, onProgress);
+  // v1.2.10 — progress & batal diteruskan ke dalam analisis
+  const a = await analyzeSpeaker(media.url, media.duration, cfg, onProgress, isCancelled);
   speakerCache.set(key, a);
   return a;
 }
@@ -407,15 +409,41 @@ export async function exportOne(opts: ExportOneOptions): Promise<Blob | null> {
   // siapkan keyframe zoom pembicara bila aktif
   let keys: CropKey[] | null = null;
   if (clip.speaker.enabled) {
-    opts.onProgress?.(0.08, "Analisis zoom pembicara…");
-    const analysis = await getCachedSpeaker(media, clip.speaker);
-    // v1.2.9 — jendela crop kini mengikuti RASIO OUTPUT (9:16/16:9)
-    keys = buildCropKeys(
-      analysis,
-      clip.speaker,
-      (media.width || 16) / (media.height || 9),
-      settings.aspect === "9:16" ? 9 / 16 : 16 / 9
+    /* v1.2.10 — 3 perbaikan laporan "stak di 11%":
+       1. PROGRESS TIDAK LAGI DIAM — analisis kini melapor tiap frame
+          ("AI mendeteksi orang… (12/600) · sisa ±2 mnt"); dulu onProgress
+          TIDAK diteruskan → bar beku di 10,5%≈11% walau masih bekerja.
+       2. ANALISIS BERBATAS WAKTU & BISA DIBATALKAN (lihat speaker.ts).
+       3. ANALISIS GAGAL ≠ EKSPOR GAGAL — bila AI benar-benar mati,
+          video tetap diekspor TANPA zoom (pesan jelas di antrean). */
+    const cached = speakerCache.get(`${media.id}|${clip.speaker.useFace}|${clip.speaker.useAudio}|${clip.speaker.silent}`);
+    opts.onProgress?.(
+      0.08,
+      cached
+        ? "Zoom pembicara: pakai hasil analisis tadi…"
+        : "Analisis zoom pembicara… (video panjang: 1–5 mnt, sekali untuk semua bagian)"
     );
+    try {
+      const analysis = await getCachedSpeaker(
+        media,
+        clip.speaker,
+        (p, stage) => opts.onProgress?.(0.08 + p * 0.02, stage),
+        opts.shouldCancel
+      );
+      // v1.2.9 — jendela crop kini mengikuti RASIO OUTPUT (9:16/16:9)
+      keys = buildCropKeys(
+        analysis,
+        clip.speaker,
+        (media.width || 16) / (media.height || 9),
+        settings.aspect === "9:16" ? 9 / 16 : 16 / 9
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/Dibatalkan/.test(msg)) throw e;
+      // v1.2.10 — AI mati total → lanjut TANPA zoom, jangan gagalkan ekspor
+      try { console.warn("[exporter] analisis pembicara gagal — ekspor lanjut tanpa zoom:", msg.slice(0, 140)); } catch {}
+      opts.onProgress?.(0.1, `Zoom pembicara dilewati (AI gagal) — video tetap diekspor…`);
+    }
   }
 
   const totalFrames = Math.ceil(totalDur * fps);
@@ -960,14 +988,26 @@ async function exportMulti(
 
     let keys: CropKey[] | null = null;
     if (clip.speaker.enabled) {
-      const analysis = await getCachedSpeaker(src.media, clip.speaker);
-      // v1.2.9 — jendela crop mengikuti rasio output
-      keys = buildCropKeys(
-        analysis,
-        clip.speaker,
-        (src.media.width || 16) / (src.media.height || 9),
-        settings.aspect === "9:16" ? 9 / 16 : 16 / 9
-      );
+      // v1.2.10 — progress & batal diteruskan; gagal analisis = lanjut tanpa zoom
+      try {
+        const analysis = await getCachedSpeaker(
+          src.media,
+          clip.speaker,
+          (p, stage) => onProgress?.(0.02 + p * 0.02, stage),
+          shouldCancel
+        );
+        // v1.2.9 — jendela crop mengikuti rasio output
+        keys = buildCropKeys(
+          analysis,
+          clip.speaker,
+          (src.media.width || 16) / (src.media.height || 9),
+          settings.aspect === "9:16" ? 9 / 16 : 16 / 9
+        );
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/Dibatalkan/.test(msg)) throw e;
+        keys = null;
+      }
     }
 
     // audio sumber → decode sekali per sumber

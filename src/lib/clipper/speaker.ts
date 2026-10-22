@@ -28,6 +28,25 @@
       panjang 1–1,5 dtk (pembicara jarang ganti di bawah 1 dtk,
       tahan-minimum sudah 1 dtk) → video 1 jam maksimum ±2.400
       sampel, dulu 7.200.
+
+   v1.2.10 — ANTI-BEKU "STAK DI 11%" (laporan: ekspor & split
+   dengan PEMBICARA berhenti di 11% selamanya):
+   6. INFERENSI AI BER-BATAS WAKTU — deteksi orang kini diberi
+      batas 30 dtk per frame (dulu TANPA batas: driver GPU macet =
+      analisis menggantung SELAMANYA di awal — persis laporan 11%).
+   7. AI SAKIT → JATUH SENDIRI — 3 kegagalan berturut-turut (timeout/
+      error) = loop AI dihentikan, analisis lanjut mode 2-bagian
+      (audio kiri/kanan). Analisis SELALU selesai, ekspor tidak pernah
+      mati karena AI.
+   8. ANGGARAN WAKTU TOTAL — loop frame+AI maks 10 menit; lewat itu
+      lanjut tanpa AI (hasil tetap dipakai seadanya).
+   9. BATAL BERFUNGSI — isCancelled dicek setiap langkah; tombol
+      BATAL pada antrean ekspor kini bereaksi di tengah analisis.
+   10. DETEKSI MULAI LANGKA — video >10 menit: AI memeriksa 1 dari
+       3 sampel; >30 menit: 1 dari 4 (pembicara tidak pindah kalau
+       cepat) → inferensi −33…−50% lagi.
+   11. PROGRESS HIDUP + ESTIMASI SISA — "AI mendeteksi orang…
+       (123/600) · sisa ±2 mnt" — tidak lagi diam di satu angka.
    ============================================================ */
 
 import type { SpeakerConfig, SpeakerSegment } from "./types";
@@ -54,7 +73,8 @@ export async function analyzeSpeaker(
   url: string,
   duration: number,
   cfg: SpeakerConfig,
-  onProgress?: (p: number, stage: string) => void
+  onProgress?: (p: number, stage: string) => void,
+  isCancelled?: () => boolean
 ): Promise<SpeakerAnalysis> {
   /* v1.2.8 — langkah adaptif: pendek 0,5 dtk · sedang 1,0 dtk · panjang 1,5 dtk
      (batas total 2.400 sampel — video 1 jam pun selesai cepat) */
@@ -68,13 +88,45 @@ export async function analyzeSpeaker(
   const W = ANALYSIS_W;
   const H = ANALYSIS_H;
 
+  /* v1.2.10 — pembatal reaktif: poling flag batal tiap 250 ms lalu
+     menyerah dari promise yang sedang berjalan (seek/inferensi/decode).
+     Yang ditinggalkan tetap berjalan di latar — tapi kita tidak menunggu. */
+  const withCancel = async <T,>(p: Promise<T>): Promise<T> => {
+    let poll: ReturnType<typeof setInterval> | undefined;
+    try {
+      return await Promise.race([
+        p,
+        new Promise<never>((_, rej) => {
+          poll = setInterval(() => {
+            if (isCancelled?.()) rej(new Error("Dibatalkan"));
+          }, 250);
+        }),
+      ]);
+    } finally {
+      if (poll) clearInterval(poll);
+    }
+  };
+
+  const ckCancel = () => {
+    if (isCancelled?.()) throw new Error("Dibatalkan");
+  };
+
   const tracker = new PersonTracker();
   const perFrameIds: number[][] = [];
   const headMotion: Record<number, number[]> = {};
   let lastBoxes: DetBox[] = [];
-  const detectEvery = 2;
+  /* v1.2.10 — deteksi mulai langka di video panjang: pembicara jarang
+     pindah posisi dalam 1–2 dtk → 1 dari 3 (video >10 mnt) atau 1 dari
+     4 sampel (video >30 mnt) yang diinferensi AI. */
+  const detectEvery = duration <= 600 ? 2 : duration <= 1800 ? 3 : 4;
   let detectCalls = 0;
   const totalDetect = Math.ceil(times.length / detectEvery);
+  // v1.2.10 — penjaga kegagalan & anggaran waktu
+  let aiFail = 0; // kegagalan berturut-turut (timeout/error)
+  let aiDead = false; // AI menyerah → lanjut audio-only
+  const AI_BUDGET_MS = 10 * 60_000; // maks 10 menit untuk seluruh loop frame+AI
+  const T0 = Date.now();
+  let lastIterMs = 0; // durasi rata-rata per iterasi → estimasi sisa
 
   onProgress?.(0.02, cfg.useFace ? "Mengambil frame sampel…" : "Menganalisis gelombang suara…");
 
@@ -118,25 +170,57 @@ export async function analyzeSpeaker(
     let pending: number | null = null; // indeks frame yang AI-nya sedang berjalan
     try {
       for (let i = 0; i < times.length; i++) {
-        const grabP = grabFrame(v, times[i], W, H, canvases[i % 3]);
+        const itT0 = Date.now();
+        ckCancel();
+        // anggaran waktu total: lewat 10 menit → AI diserahkan, analisis lanjut
+        if (Date.now() - T0 > AI_BUDGET_MS) {
+          aiDead = true;
+          onProgress?.(0.2, "Analisis AI dipangkas (video sangat panjang) — lanjut mode audio…");
+        }
+        const grabP = withCancel(grabFrame(v, times[i], W, H, canvases[i % 3]));
         // sementara frame i di-seek, AI mendeteksi frame i-1 (BERSAMAAN)
-        if (pending !== null) {
+        if (pending !== null && !aiDead) {
           let boxes: DetBox[] = [];
           try {
-            boxes = await detectPersons(canvases[pending % 3]);
+            // v1.2.10 — detectPersons kini berbatas waktu 30 dtk internal;
+            // 3 gagal berturut-turut → matikan AI (mode audio-only).
+            boxes = await withCancel(detectPersons(canvases[pending % 3]));
+            aiFail = 0;
             lastBoxes = boxes;
             detectCalls++;
+            // estimasi sisa dari kecepatan rata-rata iterasi
+            let eta = "";
+            if (lastIterMs > 0 && i < times.length) {
+              const remMs = (times.length - i) * lastIterMs;
+              const sisa = remMs >= 60_000
+                ? `${Math.round(remMs / 60_000)} mnt`
+                : `${Math.max(1, Math.round(remMs / 1000))} dtk`;
+              eta = ` · sisa ±${sisa}`;
+            }
             onProgress?.(
               0.2 + ((i - 1) / times.length) * 0.5,
-              `AI mendeteksi orang… (${detectCalls}/${totalDetect})`
+              `AI mendeteksi orang… (${detectCalls}/${totalDetect})${eta}`
             );
-          } catch {
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            if (/Dibatalkan/.test(msg)) throw e;
+            aiFail++;
             boxes = [];
+            if (aiFail >= 3) {
+              aiDead = true;
+              onProgress?.(0.2, "AI orang tidak stabil di mesin ini — lanjut mode audio 2-bagian…");
+            }
           }
           process(pending, boxes);
           pending = null;
+        } else if (pending !== null && aiDead) {
+          process(pending, []); // AI sudah mati → frame tersisa tanpa deteksi
+          pending = null;
         }
         await grabP;
+        ckCancel();
+        lastIterMs = lastIterMs > 0 ? (lastIterMs + (Date.now() - itT0)) / 2 : Date.now() - itT0;
+        if (aiDead) break; // sisanya tidak butuh frame lagi
         if (i % detectEvery === 0) {
           pending = i; // frame genap → dikirim ke AI (diproses di iterasi berikutnya)
         } else {
@@ -144,22 +228,32 @@ export async function analyzeSpeaker(
         }
       }
       // ekor: frame terakhir genap masih menunggu AI
-      if (pending !== null) {
+      if (pending !== null && !aiDead) {
         let boxes: DetBox[] = [];
         try {
-          boxes = await detectPersons(canvases[pending % 3]);
+          boxes = await withCancel(detectPersons(canvases[pending % 3]));
+          aiFail = 0;
           lastBoxes = boxes;
           detectCalls++;
-        } catch {
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (/Dibatalkan/.test(msg)) throw e;
           boxes = [];
         }
         process(pending, boxes);
+        pending = null;
+      } else if (pending !== null && aiDead) {
+        process(pending, []);
         pending = null;
       }
     } finally {
       v.removeAttribute("src");
       v.load();
       canvases.forEach((c) => (c.width = 0));
+    }
+    // v1.2.10 — AI mati di tengah → isi sisa frame tanpa deteksi
+    if (aiDead) {
+      for (let i = 0; i < times.length; i++) if (!perFrameIds[i]) perFrameIds[i] = [];
     }
   } else {
     // tanpa AI orang → analisis audio saja (mode 2-bagian), tanpa buka video
@@ -175,11 +269,24 @@ export async function analyzeSpeaker(
   onProgress?.(0.75, "Menganalisis gelombang suara…");
   let env: EnvelopePoint[] = [];
   try {
-    const buf = await decodeAudioFile(url, 120_000, 16000);
-    env = stereoEnvelope(buf, 0.25);
-  } catch {
+    // v1.2.10 — detak jantung + batal di tengah decode audio
+    const tA = Date.now();
+    const hb = setInterval(() => {
+      const dtk = Math.round((Date.now() - tA) / 1000);
+      onProgress?.(0.78, `Menganalisis gelombang suara… ${dtk} dtk`);
+    }, 2000);
+    try {
+      const buf = await withCancel(decodeAudioFile(url, 120_000, 16000));
+      env = stereoEnvelope(buf, 0.25);
+    } finally {
+      clearInterval(hb);
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/Dibatalkan/.test(msg)) throw e;
     env = [];
   }
+  ckCancel();
 
   const rmsMax = Math.max(1e-6, ...env.map((e) => e.rms));
   const isLoud = (t: number) => {
